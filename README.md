@@ -1,4 +1,8 @@
-# ESM
+# Improving Protein Language Model Generation via Sampling Strategies
+
+You can run the experiments and reproduce the results via `python cookbook/sampling_main.py`.
+
+All code is adapted from the ESM repository, linked below.
 
 <div align="center">
   <img src="_assets/logo.png" width="50"/>
