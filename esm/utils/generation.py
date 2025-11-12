@@ -246,6 +246,7 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
     entropy: ForwardTrackData,
     config: GenerationConfig,
     tokenizers: TokenizerCollectionProtocol,
+    all_logprobs: ForwardTrackData 
 ) -> torch.Tensor:
     """Get sampling mask based on forward output and config.
 
@@ -307,6 +308,19 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
             ~sampling_mask, torch.finfo(track_entropy.dtype).max
         )
         _, indices = track_entropy.topk(num_to_sample, dim=-1, largest=False)
+        is_top_k = torch.zeros((B, L), dtype=torch.bool, device=device).scatter(
+            1, indices, True
+        )
+        where_to_sample = sampling_mask & is_top_k
+    elif config.strategy == "top_margin":
+        track_entropy = getattr(entropy, track_to_sample).to(device)
+        track_all_logprobs = getattr(all_logprobs, track_to_sample).to(device)
+        #all_probs = torch.exp(track_all_logprobs) we use the difference in log probability for now 
+        top_two_probs, _ = torch.topk(track_all_logprobs, k=2, dim=-1, largest=True) #(B,L,2)
+        margin = top_two_probs[:, :, 0] - top_two_probs[:, :, 1] #(B,L)
+        margin = margin.masked_fill(~sampling_mask, -float('inf'))
+
+        _, indices = margin.topk(num_to_sample, dim=-1, largest=True) 
         is_top_k = torch.zeros((B, L), dtype=torch.bool, device=device).scatter(
             1, indices, True
         )
@@ -480,6 +494,7 @@ def iterative_sampling_tokens(
 
             # Find the positions we should sample this round.
             assert per_prompt_forward_and_sample_output.entropy is not None
+            assert per_prompt_forward_and_sample_output.all_logprob is not None 
             try:
                 where_to_sample = _get_iterative_sampling_mask_for_prompt_and_step(
                     per_prompt_cur_sampled,
@@ -489,6 +504,7 @@ def iterative_sampling_tokens(
                     per_prompt_forward_and_sample_output.entropy,
                     config,
                     tokenizers,
+                    per_prompt_forward_and_sample_output.all_logprob
                 )
             except ValueError as e:
                 errors[i] = ESMProteinError(error_code=500, error_msg=str(e))
@@ -661,6 +677,7 @@ def _sample_per_prompt(
     forward_and_sample_output_dir["protein_tensor"] = ESMProteinTensor(**tokens_dir)
     for property in [
         "entropy",
+        "all_logprob",
         "prob",
         "logprob",
         "top_prob",
@@ -816,6 +833,7 @@ def _compute_track_metadata(
         "entropy": entropy,
         "sampled_tokens": sampled_tokens,
         "prob": sampled_prob,
+        "all_logprob": log_probs, 
         "logprob": sampled_logprob,
         "top_prob": top_prob,
         "topk_logprob": topk_logprobs,

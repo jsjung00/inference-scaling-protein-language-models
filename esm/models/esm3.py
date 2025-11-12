@@ -398,7 +398,6 @@ class ESM3(nn.Module, ESM3InferenceClient):
                 "Prompts must have the same type. Got "
                 f"{t.__name__ and type(inputs[i]).__name__} instead."
             )
-
         if isinstance(inputs[0], ESMProtein):
             return iterative_sampling_raw(self, inputs, configs)  # type: ignore
         elif isinstance(inputs[0], ESMProteinTensor):

@@ -301,7 +301,7 @@ class GenerationConfig:
     # "random" will unmask a correct number of tokens randomly.
     # "entropy" will unmask the tokens with the lowest logit entropy first.
     strategy: str = attr.field(
-        validator=attr.validators.in_(["random", "entropy"]), default="random"
+        validator=attr.validators.in_(["random", "entropy", "top_margin"]), default="random"
     )
     # Setting default to 20, as there is diminishing return for decoding steps more than 20.
     # Note that this needs to be less than or equal to the sequence length.
@@ -418,6 +418,7 @@ class ForwardAndSampleOutput(LogitsOutput):
     entropy: ForwardTrackData | None = None
     # Probability of sampled token
     prob: ForwardTrackData | None = None
+    all_logprob: ForwardTrackData | None = None 
     logprob: ForwardTrackData | None = None
     # Top probability at this position
     top_prob: ForwardTrackData | None = None
