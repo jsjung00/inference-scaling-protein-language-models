@@ -4,6 +4,9 @@ from esm.sdk.api import ESM3InferenceClient, ESMProtein, GenerationConfig
 import numpy as np 
 import scipy
 import math  
+import os 
+import time 
+from datetime import datetime
 
 
 def uncond_seq_struct_gen(model, seq_len, sampling_type, num_steps):
@@ -32,18 +35,55 @@ def get_confidence_interval(values):
     correction = 1.96*std / math.sqrt(len(values))
     return mean_value - correction, mean_value + correction
 
-def uncond_generation_experiment(NUM_STEPS, SEQ_LEN):
-    model = ESM3.from_pretrained("esm3-open").to("cuda")
-    #random_samples = get_ptm_scores(256, model, 256, sampling_type="random")
-    
-    top_margin_samples = get_ptm_scores(128, model, SEQ_LEN, sampling_type="top_margin", num_steps=NUM_STEPS)
-    margin_mean = np.mean(top_margin_samples)
-    
-    top_entropy_samples = get_ptm_scores(128, model, SEQ_LEN, sampling_type="entropy", num_steps=NUM_STEPS)
-    entropy_mean = np.mean(top_entropy_samples)
-    
 
-    return {"margin_mean": margin_mean, "entropy_mean": entropy_mean, "margin_CI": get_confidence_interval(top_margin_samples)}
+class Experiment:
+    def __init__(self, exp_type, strategy='top_margin', baseline_strategies=['entropy', 'random'], num_samples=128, experiment_log_dir="./logs"):
+        self.exp_type = exp_type # ['uncond_ptm', 'tertiary_coordination'] #TODO: add diversity?
+        self.model = ESM3.from_pretrained("esm3-open").to("cuda")
+        self.num_samples = num_samples
+        self.experiment_log_dir = experiment_log_dir
+        self.strategy = strategy
+        self.baseline_strategies = baseline_strategies
+        os.makedirs(experiment_log_dir, exist_ok=True)
+
+    def run_experiment(self, seq_len, num_steps):
+        if self.exp_type == 'uncond_ptm':
+            return self.uncond_ptm(seq_len, num_steps)
+        elif self.exp_type == "tertiary_coordination":
+            pass 
+        else:
+            raise ValueError(f"Currently only support exp type ['uncond_ptm', 'tertiary_coordination']")
+
+    def sweep(self, list_num_steps, list_seq_lens):
+        now = datetime.now()
+        formatted = now.strftime("%Y-%m-%d-%H:%M:%S")
+        exp_dir = os.path.join(self.experiment_log_dir, formatted)
+        os.makedirs(exp_dir, exist_ok=True)
+        log_file_path = os.path.join(exp_dir, "log.txt")
+    
+        for seq_len in list_num_steps:
+            for num_steps in list_num_steps:
+                exp_result = self.run_experiment(seq_len, num_steps)
+                result_str = f"Seq len={seq_len} and num_steps={num_steps}: {exp_result}\n"
+                print(result_str)
+                with open(log_file_path, 'a') as f:
+                    f.write(result_str)
+
+        print(f"Experiment results finished. Results in {log_file_path}")
+
+    def uncond_ptm(self, seq_len, num_steps):
+        results = {}
+        strategy_ptm_scores = get_ptm_scores(self.num_samples, self.model, seq_len, num_steps=num_steps, sampling_type=self.strategy)
+        strategy_mean_ptm = np.mean(strategy_ptm_scores)
+        strategy_ptm_CI = get_confidence_interval(strategy_ptm_scores)
+        results[f'{self.strategy}_mean_ptm'] = strategy_mean_ptm
+        results[f"{self.strategy}_CI"] = strategy_ptm_CI
+
+        for baseline_strategy in self.baseline_strategies:
+            baseline_strategy_ptm_scores = get_ptm_scores(self.num_samples, self.model, seq_len, num_steps=num_steps, sampling_type=baseline_strategy)
+            results[f'{baseline_strategy}_mean_ptm'] = np.mean(baseline_strategy_ptm_scores)
+        return results 
+
 
 def experimenter():
     NUM_STEPS_LIST = [8, 16, 32, 64, 128, 256]
@@ -62,5 +102,7 @@ def tertiary_coor_experiment():
 
 
 if __name__ == "__main__":
-    experimenter()
+    exp = Experiment('uncond_ptm', num_samples=32)
+    result = exp.uncond_ptm(256, 64)
+    print(result)
     #uncond_generation_experiment() 
