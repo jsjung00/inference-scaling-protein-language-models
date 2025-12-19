@@ -1,10 +1,16 @@
 import os
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, Optional
 from warnings import warn
-
+from collections import deque, defaultdict 
+from dataclasses import dataclass, field
+import copy 
 import attr
 import torch
 from tqdm import tqdm
+import json 
+import logging 
+logger = logging.getLogger(__name__)
+
 
 from esm.sdk.api import (
     ESM3InferenceClient,
@@ -100,11 +106,16 @@ def iterative_sampling_raw(
     client: ESM3InferenceClient,
     proteins: list[ESMProtein],
     configs: list[GenerationConfig],
+    sample_argmax: bool, 
+    search_type: Optional[str] = 'beam' 
 ) -> list[ESMProtein | ESMProteinError]:
     # Keep structure tokens
     input_tokens = [client.encode(protein) for protein in proteins]
-
-    output_tokens_list = client.batch_generate(input_tokens, configs)
+  
+    if search_type is not None:
+        output_tokens_list = client.search_batch_generate(input_tokens, configs, search_type, sample_argmax=sample_argmax) 
+    else:
+        output_tokens_list = client.batch_generate(input_tokens, configs, sample_argmax=sample_argmax)
 
     raw_proteins: list[ESMProtein | ESMProteinError] = []
     for output_tokens in output_tokens_list:
@@ -236,6 +247,49 @@ def _get_masked_positions(
     mask[..., -1] = False
 
     return mask
+
+def _get_all_denoise_sampling_mask(
+    cur_sampled: _BatchedESMProteinTensor,
+    sequence_lengths: torch.Tensor,
+    total_to_sample: torch.Tensor,
+    step: int,
+    entropy: ForwardTrackData,
+    config: GenerationConfig,
+    tokenizers: TokenizerCollectionProtocol,
+    all_logprobs: ForwardTrackData):
+    track_to_sample = config.track
+    tokens = getattr(cur_sampled, track_to_sample)
+    device = tokens.device
+
+    shape = tokens.shape
+    B, L = shape[0], shape[1]
+
+    # TODO: figure out why we want this function to work with
+    # _BatchedESMProteinTensor in the first place. Logics below
+    # don't really work for batched tensors.
+    assert B == 1
+
+    sampling_mask = torch.ones((B, L), dtype=torch.bool, device=device)
+    sampling_mask[:, 0] = False  # BOS
+    # EOS and all padding tokens.
+    sampling_mask &= (
+        torch.arange(L).repeat(B, 1) < (sequence_lengths - 1).unsqueeze(-1)
+    ).to(device)
+
+    is_mask = _get_masked_positions(
+        track_to_sample, tokens, getattr(tokenizers, track_to_sample).mask_token_id
+    )
+    if not is_mask.any().item():
+        raise ValueError(f"Cannot sample {config.track} when input has no masks.")
+    sampling_mask = sampling_mask & is_mask
+
+    where_to_sample = sampling_mask
+    if track_to_sample == "function":
+        where_to_sample = where_to_sample.unsqueeze(-1).expand(
+            B, L, tokenizers.function.depth
+        )  # (B, L) -> (B, L, D)
+
+    return where_to_sample
 
 
 def _get_iterative_sampling_mask_for_prompt_and_step(
@@ -371,17 +425,20 @@ def iterative_sampling_tokens(
     input_tokens: list[ESMProteinTensor],
     configs: list[GenerationConfig],
     tokenizers: TokenizerCollectionProtocol,
+    sample_argmax: bool = False 
 ) -> Sequence[ESMProteinTensor | ESMProteinError]:
     devices = set([t.device for t in input_tokens])
     if len(devices) > 1:
         raise AttributeError(f"Input tokens on multiple devices {devices}")
-
+    
     sampled_tokens = [attr.evolve(tokens) for tokens in input_tokens]
+
 
     # Clear structure tokens if user would like to condition only on coordinates.
     for tokens, config in zip(sampled_tokens, configs):
         if config.condition_on_coordinates_only and tokens.coordinates is not None:
             tokens.structure = None
+    
 
     # Total sequence lengths.
     sequence_lengths = [len(tokens) for tokens in sampled_tokens]
@@ -486,6 +543,7 @@ def iterative_sampling_tokens(
                 sampling_config,
                 tokenizers,
                 decode_sasa_tokens=False,
+                sample_argmax=sample_argmax
             )
 
             # All positions sampled after _sample_per_prompt() above.
@@ -549,6 +607,431 @@ def iterative_sampling_tokens(
 
     return output_tokens
 
+@dataclass 
+class BeamChild:
+    batched_tokens: ESMProteinTensor
+    forward_out: torch.Tensor 
+    t: int 
+    score: Optional[float]
+
+def search_iterative_sampling_tokens(
+    client: ESM3InferenceClient,
+    input_tokens: list[ESMProteinTensor],
+    configs: list[GenerationConfig],
+    tokenizers: TokenizerCollectionProtocol,
+    search_type: str,
+    sample_argmax: bool = False  
+) -> Sequence[ESMProteinTensor | ESMProteinError]:
+    '''
+    Like iterative sampling tokens but implements tree search for generation.
+    Assume batch size is 1. 
+
+    Params:
+        search_type: (str) "beam" or "mcts"
+    '''
+    devices = set([t.device for t in input_tokens])
+    if len(devices) > 1:
+        raise AttributeError(f"Input tokens on multiple devices {devices}")
+    
+    sampled_tokens = [attr.evolve(tokens) for tokens in input_tokens]
+
+    assert len(configs) == 1
+    # Clear structure tokens if user would like to condition only on coordinates.
+    for tokens, config in zip(sampled_tokens, configs):
+        if config.condition_on_coordinates_only and tokens.coordinates is not None:
+            tokens.structure = None
+    
+
+    # Total sequence lengths.
+    sequence_lengths = [len(tokens) for tokens in sampled_tokens]
+    # Figure out the number of tokens to be sampled for each prompt.
+    total_to_sample = []
+    for protein, config in zip(sampled_tokens, configs):
+        track = config.track
+
+        if getattr(protein, track) is None:
+            # We need to sample the entire track.
+            num_sampling_steps = _get_non_special_tokens(protein, tokenizers)
+        else:
+            masked = _get_masked_positions(
+                track, getattr(protein, track), getattr(tokenizers, track).mask_token_id
+            )
+            num_sampling_steps = torch.sum(masked).item()
+
+        total_to_sample.append(num_sampling_steps)
+
+        # Users might over-specify the number of sampling steps for a given prompt
+        # TODO: Give a warning about mismatched num_steps and number of masks.
+        if (num_sampling_steps > 0) and (num_sampling_steps < config.num_steps):
+            config.num_steps = int(num_sampling_steps)
+
+    # Different prompts may ask for different number of decoding steps.
+    # For now, we simply run the max number of steps.
+    # TODO: return completed proteins as soon as they are finished sampling.
+    max_num_steps = max([config.num_steps for config in configs])
+
+    # Now stack the list to make a single batched ESMProteinTensor.
+    batched_tokens = _stack_protein_tensors(
+        sampled_tokens, sequence_lengths, tokenizers, devices.pop()
+    )
+
+    # Remember sampled prompts that has somehow errored out.
+    errors: dict[int, ESMProteinError] = {}
+
+    def get_beam_child(batched_tokens, forward_out, t, score, configs):
+        '''
+        NOTE: assume that batch is 1! 
+
+        Returns:
+            BeamChild 
+        ''' 
+        assert len(configs) == 1
+
+        child_batched_tokens = copy.deepcopy(batched_tokens)
+        for i, config in enumerate(configs):  # B
+            if i in errors:
+                # This prompts has errored out in previous steps.
+                # Skip.
+                continue
+
+            if config.track in ["coordinates", "residue_annotations"]:
+                errors[i] = ESMProteinError(
+                    error_code=500,
+                    error_msg=f"Iterative sampling {config.track} is not supported.",
+                )
+                continue
+
+            if t >= config.num_steps:
+                # Done sampling for this row. Shouldn't ever execute because we stop before. 
+                child = BeamChild(child_batched_tokens, forward_out, t, score)
+                return child 
+
+            per_prompt_cur_sampled = _BatchedESMProteinTensor.from_protein_tensor(
+                batched_tokens.slice(i)
+            )
+            per_prompt_forward_out: LogitsOutput = _slice_tensor_dataclass(
+                forward_out, i, keep_dim=True
+            )
+            # Trim logits to proper sequence length for this prompt.
+            per_prompt_forward_out = _trim_sequence_tensor_dataclass(
+                per_prompt_forward_out,
+                # Note(jungong) : we can not smiply use sequence_lenths[i] here,
+                # what we want is for the sequence length of the logits to match
+                # that of the prompt, which may or may not be padded, depending on
+                # whether the padding was done locally with the open source model
+                # (where per_prompt_cur_sampled is already padded) or by
+                # BatchedESM3ModelRunner (where per_prompt_cur_sampled is not padded).
+                len(per_prompt_cur_sampled),
+            )
+
+            # Handle temperature annealing, since _sample_per_prompt() doesn't have
+            # the concept of decoding steps.
+            if config.temperature_annealing:
+                temperature = _get_annealed_temperature(
+                    t, config.num_steps, config.temperature
+                )
+            else:
+                temperature = config.temperature
+
+            track_sample_config = SamplingTrackConfig()
+            track_sample_config.invalid_ids = config.invalid_ids
+            track_sample_config.temperature = temperature
+            track_sample_config.top_p = config.top_p
+            sampling_config = SamplingConfig(**{config.track: track_sample_config})  # type: ignore
+
+            # Sampling has to be done per-prompt, since sampling configs
+            # are likely be different for different prompts.
+            per_prompt_forward_and_sample_output = _sample_per_prompt(
+                per_prompt_cur_sampled,
+                per_prompt_forward_out,
+                sampling_config,
+                tokenizers,
+                decode_sasa_tokens=False,
+                sample_argmax=sample_argmax
+            )
+
+            # All positions sampled after _sample_per_prompt() above.
+            # (B, L) & (B, L, D)
+            per_prompt_new_sampled = per_prompt_forward_and_sample_output.protein_tensor
+
+            # Find the positions we should sample this round.
+            assert per_prompt_forward_and_sample_output.entropy is not None
+            assert per_prompt_forward_and_sample_output.all_logprob is not None 
+            try:
+                where_to_sample = _get_iterative_sampling_mask_for_prompt_and_step(
+                    per_prompt_cur_sampled,
+                    torch.tensor(sequence_lengths[i]),
+                    torch.tensor(total_to_sample[i]),
+                    t,
+                    per_prompt_forward_and_sample_output.entropy,
+                    config,
+                    tokenizers,
+                    per_prompt_forward_and_sample_output.all_logprob
+                )
+            except ValueError as e:
+                errors[i] = ESMProteinError(error_code=500, error_msg=str(e))
+                continue
+
+            where_to_sample.to(input_tokens[0].device)
+
+            try:
+                all_where_to_sample = _get_all_denoise_sampling_mask(
+                    per_prompt_cur_sampled,
+                    torch.tensor(sequence_lengths[i]),
+                    torch.tensor(total_to_sample[i]),
+                    t,
+                    per_prompt_forward_and_sample_output.entropy,
+                    config,
+                    tokenizers,
+                    per_prompt_forward_and_sample_output.all_logprob
+                )
+            except ValueError as e:
+                errors[i] = ESMProteinError(error_code=500, error_msg=str(e))
+                continue
+            all_where_to_sample.to(input_tokens[0].device)
+
+            old_track_samples = getattr(per_prompt_cur_sampled, config.track)
+            new_track_samples = getattr(per_prompt_new_sampled, config.track)
+
+
+            all_denoised_samples = torch.where(
+                all_where_to_sample, new_track_samples, old_track_samples
+            )
+
+            # Iterative sampling by picking the tokens sampled this round
+            # from new_track_samples to old_track_samples.
+            new_track_samples = torch.where(
+                where_to_sample, new_track_samples, old_track_samples
+            )
+            
+            # Update the corresponding row with new data.
+            getattr(child_batched_tokens, config.track)[i, ...] = new_track_samples[0]
+
+            lookahead_batched_tokens = copy.deepcopy(batched_tokens)
+            getattr(lookahead_batched_tokens, config.track)[i, ...] = all_denoised_samples[0]
+            
+            # calculate a new forward_out based on our new batched tokens
+            child_forward_out = _batch_forward(client, child_batched_tokens)
+            # calculate the pTM score for look ahead all denoised sample
+            lookahead_output_tokens = [
+                lookahead_batched_tokens.slice(i, sequence_len=sequence_lengths[i])
+                if i not in errors
+                else errors[i]
+                for i in range(len(input_tokens))
+            ]
+          
+            lookahead_protein = client.decode(lookahead_output_tokens[0])
+            score = lookahead_protein.ptm.item()   
+
+            child = BeamChild(child_batched_tokens, child_forward_out, t+1, score)
+            return child 
+
+
+    # Decode
+    if search_type == "tree":
+        beam_num_child = configs[0].beam_num_child
+        beam_best_k = configs[0].beam_best_k
+        nfes = 0 
+        queue = deque()
+        leaf_node_generated_structures = [] 
+        forward_out = _batch_forward(client, batched_tokens)
+        nfes += 1
+        parent_node = BeamChild(batched_tokens, forward_out, 0, None)
+        queue.append(parent_node)
+        
+        intermediate_values = defaultdict(list)
+
+        while len(queue) > 0:
+            parent_node = queue.popleft()
+            if parent_node.t >= configs[0].num_steps:
+                leaf_node_generated_structures.append(parent_node)
+                continue 
+
+            beam_children = [] 
+            for _ in range(beam_num_child):
+                child = get_beam_child(parent_node.batched_tokens, parent_node.forward_out, parent_node.t, parent_node.score, configs)
+                nfes += 1
+                beam_children.append(child)
+
+            # log all the intermediate values
+            for child in beam_children:
+                intermediate_values[int(child.t)].append(child.score)
+            
+            top_k_children = sorted(beam_children, key=lambda x: x.score, reverse=True)[:beam_best_k]
+            queue.extend(top_k_children)
+        
+        batched_tokens = max(leaf_node_generated_structures, key=lambda x: x.score).batched_tokens
+        print(f"Number of NFEs: {nfes}")
+        # UNCOMMENT to save for intermediate value analysis
+        #logger.info(json.dumps(intermediate_values))
+
+    elif search_type == "beam":
+        beam_num_child = configs[0].beam_num_child
+        beam_best_k = configs[0].beam_best_k
+        nfes = 0 
+        queue = deque()
+        leaf_node_generated_structures = [] 
+        forward_out = _batch_forward(client, batched_tokens)
+        nfes += 1
+        parent_node = BeamChild(batched_tokens, forward_out, 0, None)
+        queue.append(parent_node)
+        
+        intermediate_values = defaultdict(list)
+        while len(queue) > 0:
+            # Expand ALL nodes currently in queue
+            all_children = []
+            while queue:
+                parent_node = queue.popleft()
+                if parent_node.t >= configs[0].num_steps:
+                    leaf_node_generated_structures.append(parent_node)
+                    continue
+                
+                for _ in range(beam_num_child):
+                    child = get_beam_child(parent_node.batched_tokens, parent_node.forward_out, parent_node.t, parent_node.score, configs)
+                    nfes += 1
+                    all_children.append(child)
+            
+            # Global pruning - keep only top k across ALL children
+            top_k_children = sorted(all_children, key=lambda x: x.score, reverse=True)[:beam_best_k]
+            queue.extend(top_k_children)
+
+        batched_tokens = max(leaf_node_generated_structures, key=lambda x: x.score).batched_tokens
+        print(f"Number of NFEs: {nfes}")
+        pass 
+            
+    elif search_type == "mcts":
+        raise NotImplementedError("Finish MCTS") 
+    else:
+        disable_tqdm = bool(os.environ.get("DISABLE_ITERATIVE_SAMPLING_TQDM", False))
+        for t in tqdm(range(max_num_steps), disable=disable_tqdm):
+            forward_out = _batch_forward(client, batched_tokens)
+
+            # Sample each prompt individually, since their configuration may
+            # be very different.
+            # TODO: downstream utils work with batch dimsension.
+            # Group by sampling configurations and sample those prompts together.
+            for i, config in enumerate(configs):  # B
+                if i in errors:
+                    # This prompts has errored out in previous steps.
+                    # Skip.
+                    continue
+
+                if config.track in ["coordinates", "residue_annotations"]:
+                    errors[i] = ESMProteinError(
+                        error_code=500,
+                        error_msg=f"Iterative sampling {config.track} is not supported.",
+                    )
+                    continue
+
+                if t >= config.num_steps:
+                    # Done sampling for this row.
+                    continue
+
+                per_prompt_cur_sampled = _BatchedESMProteinTensor.from_protein_tensor(
+                    batched_tokens.slice(i)
+                )
+                per_prompt_forward_out: LogitsOutput = _slice_tensor_dataclass(
+                    forward_out, i, keep_dim=True
+                )
+                # Trim logits to proper sequence length for this prompt.
+                per_prompt_forward_out = _trim_sequence_tensor_dataclass(
+                    per_prompt_forward_out,
+                    # Note(jungong) : we can not smiply use sequence_lenths[i] here,
+                    # what we want is for the sequence length of the logits to match
+                    # that of the prompt, which may or may not be padded, depending on
+                    # whether the padding was done locally with the open source model
+                    # (where per_prompt_cur_sampled is already padded) or by
+                    # BatchedESM3ModelRunner (where per_prompt_cur_sampled is not padded).
+                    len(per_prompt_cur_sampled),
+                )
+
+                # Handle temperature annealing, since _sample_per_prompt() doesn't have
+                # the concept of decoding steps.
+                if config.temperature_annealing:
+                    temperature = _get_annealed_temperature(
+                        t, config.num_steps, config.temperature
+                    )
+                else:
+                    temperature = config.temperature
+
+                track_sample_config = SamplingTrackConfig()
+                track_sample_config.invalid_ids = config.invalid_ids
+                track_sample_config.temperature = temperature
+                track_sample_config.top_p = config.top_p
+                sampling_config = SamplingConfig(**{config.track: track_sample_config})  # type: ignore
+
+                # Sampling has to be done per-prompt, since sampling configs
+                # are likely be different for different prompts.
+                per_prompt_forward_and_sample_output = _sample_per_prompt(
+                    per_prompt_cur_sampled,
+                    per_prompt_forward_out,
+                    sampling_config,
+                    tokenizers,
+                    decode_sasa_tokens=False,
+                    sample_argmax=sample_argmax
+                )
+
+                # All positions sampled after _sample_per_prompt() above.
+                # (B, L) & (B, L, D)
+                per_prompt_new_sampled = per_prompt_forward_and_sample_output.protein_tensor
+
+                # Find the positions we should sample this round.
+                assert per_prompt_forward_and_sample_output.entropy is not None
+                assert per_prompt_forward_and_sample_output.all_logprob is not None 
+                try:
+                    where_to_sample = _get_iterative_sampling_mask_for_prompt_and_step(
+                        per_prompt_cur_sampled,
+                        torch.tensor(sequence_lengths[i]),
+                        torch.tensor(total_to_sample[i]),
+                        t,
+                        per_prompt_forward_and_sample_output.entropy,
+                        config,
+                        tokenizers,
+                        per_prompt_forward_and_sample_output.all_logprob
+                    )
+                except ValueError as e:
+                    errors[i] = ESMProteinError(error_code=500, error_msg=str(e))
+                    continue
+
+                where_to_sample.to(input_tokens[0].device)
+
+                old_track_samples = getattr(per_prompt_cur_sampled, config.track)
+                new_track_samples = getattr(per_prompt_new_sampled, config.track)
+
+                # Iterative sampling by picking the tokens sampled this round
+                # from new_track_samples to old_track_samples.
+                new_track_samples = torch.where(
+                    where_to_sample, new_track_samples, old_track_samples
+                )
+
+                # Update the corresponding row with new data.
+                getattr(batched_tokens, config.track)[i, ...] = new_track_samples[0]
+
+    # Un-pack to a list of single ProteinTypes.
+    output_tokens = [
+        batched_tokens.slice(i, sequence_len=sequence_lengths[i])
+        if i not in errors
+        else errors[i]
+        for i in range(len(input_tokens))
+    ]
+
+    # Do not update tracks that were not sampled (e.g. keep None instead of masks)
+    for inputs, outputs, config in zip(input_tokens, output_tokens, configs):
+        if isinstance(outputs, ESMProteinError):
+            continue
+
+        # First restore coordinates field.
+        # We know coordinates can never be iteratively sampled.
+        setattr(outputs, "coordinates", getattr(inputs, "coordinates"))
+        # Maybe restore all the other fields.
+        for f in attr.fields(SamplingConfig):
+            if "embedding" in f.name or f.name == "return_hidden_states":
+                continue
+            if f.name != config.track:
+                setattr(outputs, f.name, getattr(inputs, f.name))
+
+    return output_tokens
+
 
 def _batch_forward(client: ESM3InferenceClient, protein: _BatchedESMProteinTensor):
     # Forward pass
@@ -573,6 +1056,7 @@ def _sample_per_prompt(
     tokenizers: TokenizerCollectionProtocol,
     decode_sasa_tokens: bool = True,
     mask_logits_of_invalid_ids: bool = True,
+    sample_argmax: bool = False 
 ) -> ForwardAndSampleOutput:
     assert logits_output.logits is not None
 
@@ -663,6 +1147,7 @@ def _sample_per_prompt(
             tokens=getattr(protein, "function"),
             logits=function_logits,
             sampling_track_config=config,
+            sample_argmax=sample_argmax
         )
         tokens_dir["function"] = sampling_metadata.pop("sampled_tokens")  # (L, D)
         track_sampling_metadata_dir["function"] = sampling_metadata
@@ -755,6 +1240,7 @@ def _sample_function_track(
     tokens: torch.Tensor,
     logits: torch.Tensor,
     sampling_track_config: SamplingTrackConfig,
+    sample_argmax: bool 
 ) -> dict[str, torch.Tensor]:
     """Works with inputs that have batch dimension."""
     # Do not sample at BOS and EOS tokens
@@ -767,6 +1253,7 @@ def _sample_function_track(
         function_tokenizer,
         top_p=sampling_track_config.top_p,
         temperature=sampling_track_config.temperature,
+        sample_argmax=sample_argmax
     )
     if sampling_track_config.only_sample_masked_tokens:
         is_mask = torch.all(

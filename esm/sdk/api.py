@@ -311,6 +311,8 @@ class GenerationConfig:
     top_p: float = 1.0
     condition_on_coordinates_only: bool = True
     only_compute_backbone_rmsd: bool = False
+    beam_num_child: int =  1 
+    beam_best_k: int = 1 
 
     def use_entropy_based_unmasking_strategy(self):
         """Use entropy based unmasking strategy during generation."""
@@ -444,10 +446,16 @@ class ESM3InferenceClient(ABC):
         raise NotImplementedError
 
     def batch_generate(
-        self, inputs: Sequence[ProteinType], configs: Sequence[GenerationConfig]
+        self, inputs: Sequence[ProteinType], configs: Sequence[GenerationConfig], sample_argmax: bool 
     ) -> Sequence[ProteinType]:
         # Same as generate(...), but generates a batch of proteins at once.
-        raise NotImplementedError
+        raise NotImplementedError 
+    
+    def search_batch_generate(self, inputs: Sequence[ProteinType], configs: Sequence[GenerationConfig],
+                               search_type: str, sample_argmax: bool  
+    ) -> Sequence[ProteinType]:
+        # Same as generate(...), but generates a batch of proteins at once.
+        raise NotImplementedError 
 
     async def async_batch_generate(
         self, inputs: Sequence[ProteinType], configs: Sequence[GenerationConfig]

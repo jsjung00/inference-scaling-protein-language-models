@@ -199,6 +199,7 @@ def sample_logits(
 def sample_function_logits(
     logits: torch.Tensor,
     tokenizer: InterProQuantizedTokenizer,
+    sample_argmax: bool, 
     top_p: float | torch.Tensor = 1.0,
     temperature: float | torch.Tensor = 1.0,
     p_none_threshold: float = 0.05,
@@ -230,8 +231,12 @@ def sample_function_logits(
     mask = indices == none_index  # (V,)
     mask = expanded_where_not_none & mask  # (B, L, D, 1) x (V,) -> (B, L, D, V)
     log_p[mask] = -torch.inf
+    
+    if sample_argmax:
+        ids = torch.argmax(log_p, dim=-1)  # (B, L, D)
+    else:
+        ids = torch.distributions.Categorical(logits=log_p).sample() 
 
-    ids = torch.argmax(log_p, dim=-1)  # (B, L, D)
     ids[where_none, :] = tokenizer.vocab_to_index["<none>"]
 
     return ids, log_p

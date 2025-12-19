@@ -37,6 +37,7 @@ from esm.utils.generation import (
     _slice_tensor_dataclass,
     iterative_sampling_raw,
     iterative_sampling_tokens,
+    search_iterative_sampling_tokens
 )
 from esm.utils.misc import rbf
 from esm.utils.sampling import (
@@ -343,8 +344,10 @@ class ESM3(nn.Module, ESM3InferenceClient):
         structure_coords = structure_coords[
             ..., :3, :
         ]  # In case we pass in an atom14 or atom37 repr
+    
+ 
         affine, affine_mask = build_affine3d_from_coordinates(structure_coords)
-
+    
         structure_tokens = defaults(structure_tokens, C.STRUCTURE_MASK_TOKEN)
         assert structure_tokens is not None
         structure_tokens = (
@@ -374,14 +377,15 @@ class ESM3(nn.Module, ESM3InferenceClient):
         return self.output_heads(x, embedding)
 
     # The following methods are for the ESM3InferenceClient interface
-    def generate(self, input: ProteinType, config: GenerationConfig) -> ProteinType:
+    def generate(self, input: ProteinType, config: GenerationConfig, sample_argmax: bool) -> ProteinType:
         """Wrap around batched generation."""
-        proteins = self.batch_generate([input], [config])
+        proteins = self.batch_generate([input], [config], sample_argmax)
         assert len(proteins) == 1
         return proteins[0]
 
     def batch_generate(
-        self, inputs: list[ProteinType], configs: list[GenerationConfig]
+        self, inputs: list[ProteinType], configs: list[GenerationConfig],
+        sample_argmax: bool 
     ) -> list[ProteinType]:
         assert len(inputs) == len(
             configs
@@ -399,13 +403,54 @@ class ESM3(nn.Module, ESM3InferenceClient):
                 f"{t.__name__ and type(inputs[i]).__name__} instead."
             )
         if isinstance(inputs[0], ESMProtein):
-            return iterative_sampling_raw(self, inputs, configs)  # type: ignore
+            return iterative_sampling_raw(self, inputs, configs, sample_argmax=sample_argmax, search_type=None)  # type: ignore
         elif isinstance(inputs[0], ESMProteinTensor):
             return iterative_sampling_tokens(
                 self,
                 inputs,  # type: ignore
                 configs,
                 self.tokenizers,  # type: ignore
+                sample_argmax=sample_argmax
+            )
+        else:
+            raise ValueError("Input must be an ESMProtein or ESMProteinTensor")
+
+    def search_batch_generate(
+        self, inputs: list[ProteinType], configs: list[GenerationConfig], search_type: str,
+        sample_argmax: bool  
+    ) -> list[ProteinType]:
+        '''
+        Implements tree search generation. 
+
+        Params:
+            search_type: "beam" or "mcts" 
+        '''
+        assert len(inputs) == len(
+            configs
+        ), "Must have the same number of prompts and configs."
+
+        assert search_type in ["beam", "mcts"]
+
+        if inputs == []:
+            # Nothing to do.
+            return []
+
+        # Make sure prompts are of the same type.
+        t = type(inputs[0])
+        for i in range(1, len(inputs)):
+            assert isinstance(inputs[i], t), (
+                "Prompts must have the same type. Got "
+                f"{t.__name__ and type(inputs[i]).__name__} instead."
+            )
+        if isinstance(inputs[0], ESMProtein):
+            return iterative_sampling_raw(self, inputs, configs, search_type=search_type,sample_argmax=sample_argmax)  # type: ignore
+        elif isinstance(inputs[0], ESMProteinTensor):
+            return search_iterative_sampling_tokens(self,
+                inputs,  # type: ignore
+                configs,
+                self.tokenizers,  # type: ignore
+                search_type=search_type,
+                sample_argmax=sample_argmax 
             )
         else:
             raise ValueError("Input must be an ESMProtein or ESMProteinTensor")
