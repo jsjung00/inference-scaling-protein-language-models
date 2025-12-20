@@ -520,18 +520,18 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
 
             old_track_samples = getattr(per_prompt_cur_sampled, config.track)
             new_track_samples = getattr(per_prompt_new_sampled, config.track)
-
-            # Iterative sampling by picking the tokens sampled this round
-            # from new_track_samples to old_track_samples.
-            new_track_samples = torch.where(
-                where_to_sample, new_track_samples, old_track_samples
-            )
             if config.track == "structure":
                 score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
                         i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
                         input_tokens, batched_tokens, client)
                 print(f"Timestep {t}: score {score}")
 
+            # Iterative sampling by picking the tokens sampled this round
+            # from new_track_samples to old_track_samples.
+            new_track_samples = torch.where(
+                where_to_sample, new_track_samples, old_track_samples
+            )
+            
             # Update the corresponding row with new data.
             getattr(batched_tokens, config.track)[i, ...] = new_track_samples[0]
 
@@ -593,116 +593,9 @@ def iterative_sampling_tokens(
 
     # Decode
     disable_tqdm = bool(os.environ.get("DISABLE_ITERATIVE_SAMPLING_TQDM", False))
-    #run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, errors,
-    #            tokenizers, sample_argmax,sequence_lengths,total_to_sample, input_tokens)
-    for t in tqdm(range(max_num_steps), disable=disable_tqdm):
-        forward_out = _batch_forward(client, batched_tokens)
-
-        # Sample each prompt individually, since their configuration may
-        # be very different.
-        # TODO: downstream utils work with batch dimsension.
-        # Group by sampling configurations and sample those prompts together.
-        for i, config in enumerate(configs):  # B
-            if i in errors:
-                # This prompts has errored out in previous steps.
-                # Skip.
-                continue
-
-            if config.track in ["coordinates", "residue_annotations"]:
-                errors[i] = ESMProteinError(
-                    error_code=500,
-                    error_msg=f"Iterative sampling {config.track} is not supported.",
-                )
-                continue
-
-            if t >= config.num_steps:
-                # Done sampling for this row.
-                continue
-
-            per_prompt_cur_sampled = _BatchedESMProteinTensor.from_protein_tensor(
-                batched_tokens.slice(i)
-            )
-            per_prompt_forward_out: LogitsOutput = _slice_tensor_dataclass(
-                forward_out, i, keep_dim=True
-            )
-            # Trim logits to proper sequence length for this prompt.
-            per_prompt_forward_out = _trim_sequence_tensor_dataclass(
-                per_prompt_forward_out,
-                # Note(jungong) : we can not smiply use sequence_lenths[i] here,
-                # what we want is for the sequence length of the logits to match
-                # that of the prompt, which may or may not be padded, depending on
-                # whether the padding was done locally with the open source model
-                # (where per_prompt_cur_sampled is already padded) or by
-                # BatchedESM3ModelRunner (where per_prompt_cur_sampled is not padded).
-                len(per_prompt_cur_sampled),
-            )
-
-            # Handle temperature annealing, since _sample_per_prompt() doesn't have
-            # the concept of decoding steps.
-            if config.temperature_annealing:
-                temperature = _get_annealed_temperature(
-                    t, config.num_steps, config.temperature
-                )
-            else:
-                temperature = config.temperature
-
-            track_sample_config = SamplingTrackConfig()
-            track_sample_config.invalid_ids = config.invalid_ids
-            track_sample_config.temperature = temperature
-            track_sample_config.top_p = config.top_p
-            sampling_config = SamplingConfig(**{config.track: track_sample_config})  # type: ignore
-
-            # Sampling has to be done per-prompt, since sampling configs
-            # are likely be different for different prompts.
-            per_prompt_forward_and_sample_output = _sample_per_prompt(
-                per_prompt_cur_sampled,
-                per_prompt_forward_out,
-                sampling_config,
-                tokenizers,
-                decode_sasa_tokens=False,
-                sample_argmax=sample_argmax
-            )
-
-            # All positions sampled after _sample_per_prompt() above.
-            # (B, L) & (B, L, D)
-            per_prompt_new_sampled = per_prompt_forward_and_sample_output.protein_tensor
-
-            # Find the positions we should sample this round.
-            assert per_prompt_forward_and_sample_output.entropy is not None
-            assert per_prompt_forward_and_sample_output.all_logprob is not None 
-            try:
-                where_to_sample = _get_iterative_sampling_mask_for_prompt_and_step(
-                    per_prompt_cur_sampled,
-                    torch.tensor(sequence_lengths[i]),
-                    torch.tensor(total_to_sample[i]),
-                    t,
-                    per_prompt_forward_and_sample_output.entropy,
-                    config,
-                    tokenizers,
-                    per_prompt_forward_and_sample_output.all_logprob
-                )
-            except ValueError as e:
-                errors[i] = ESMProteinError(error_code=500, error_msg=str(e))
-                continue
-
-            where_to_sample.to(input_tokens[0].device)
-
-            old_track_samples = getattr(per_prompt_cur_sampled, config.track)
-            new_track_samples = getattr(per_prompt_new_sampled, config.track)
-
-            # Iterative sampling by picking the tokens sampled this round
-            # from new_track_samples to old_track_samples.
-            new_track_samples = torch.where(
-                where_to_sample, new_track_samples, old_track_samples
-            )
-
-            # Update the corresponding row with new data.
-            getattr(batched_tokens, config.track)[i, ...] = new_track_samples[0]
-
-            if configs[0].track == "structure":
-                breakpoint()
-
-
+    run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, errors,
+                tokenizers, sample_argmax,sequence_lengths,total_to_sample, input_tokens)
+    
     # Un-pack to a list of single ProteinTypes.
     output_tokens = [
         batched_tokens.slice(i, sequence_len=sequence_lengths[i])
@@ -835,7 +728,7 @@ def search_iterative_sampling_tokens(
     # Remember sampled prompts that has somehow errored out.
     errors: dict[int, ESMProteinError] = {}
 
-    def get_beam_child(batched_tokens, forward_out, t, score, configs):
+    def get_beam_child(batched_tokens, forward_out, t, configs):
         '''
         NOTE: assume that batch is 1! 
 
@@ -936,6 +829,13 @@ def search_iterative_sampling_tokens(
             # Iterative sampling by picking the tokens sampled this round
             # from new_track_samples to old_track_samples.
             old_track_samples = getattr(per_prompt_cur_sampled, config.track)
+            if config.track == "structure":
+                score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                        i, t, per_prompt_forward_and_sample_output, config, tokenizers, input_tokens, batched_tokens, client)
+                print(f"Child score {score}")
+                if score is None:
+                    raise ValueError("Error ocurred, failed to get score") 
+
             new_track_samples = torch.where(
                 where_to_sample, new_track_samples, old_track_samples
             )
@@ -946,10 +846,6 @@ def search_iterative_sampling_tokens(
             # calculate a new forward_out based on our new batched tokens
             child_forward_out = _batch_forward(client, child_batched_tokens)
 
-            score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
-                       i, t, per_prompt_forward_and_sample_output, config, tokenizers, input_tokens, batched_tokens, client)
-            if score is None:
-                raise ValueError("Error ocurred, failed to get score") 
 
             child = BeamChild(child_batched_tokens, child_forward_out, t+1, score)
             return child 
@@ -978,7 +874,7 @@ def search_iterative_sampling_tokens(
 
             beam_children = [] 
             for _ in range(beam_num_child):
-                child = get_beam_child(parent_node.batched_tokens, parent_node.forward_out, parent_node.t, parent_node.score, configs)
+                child = get_beam_child(parent_node.batched_tokens, parent_node.forward_out, parent_node.t, configs)
                 nfes += 1
                 beam_children.append(child)
 
@@ -995,7 +891,6 @@ def search_iterative_sampling_tokens(
         #logger.info(json.dumps(intermediate_values))
 
     elif search_type == "beam":
-        breakpoint()
         beam_num_child = configs[0].beam_num_child
         beam_best_k = configs[0].beam_best_k
         beam_warmup_steps = configs[0].beam_warmup_steps
@@ -1037,8 +932,7 @@ def search_iterative_sampling_tokens(
 
                 for _ in range(beam_num_child):
                     try:
-                        breakpoint()
-                        child = get_beam_child(parent_node.batched_tokens, parent_node.forward_out, parent_node.t, parent_node.score, configs)
+                        child = get_beam_child(parent_node.batched_tokens, parent_node.forward_out, parent_node.t, configs)
                     except:
                         continue 
                     nfes += 1
