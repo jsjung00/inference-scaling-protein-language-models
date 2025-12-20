@@ -17,14 +17,15 @@ import torch
 from pathlib import Path 
 
 def uncond_seq_struct_gen(model, seq_len, sampling_type, num_steps, search_type, sample_argmax=False,\
-                          beam_num_child=1, beam_best_k=1):
+                          beam_num_child=1, beam_best_k=1, beam_warmup_steps=0):
     prompt = "_" * seq_len
     protein = ESMProtein(sequence=prompt)
   
     if search_type is not None and search_type in ['mcts', 'beam', 'tree']:
         # only use search for structure generation for now  
         sequence = model.generate(protein, GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type), sample_argmax=sample_argmax)
-        structure = model.search_batch_generate([sequence], [GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type, beam_num_child=beam_num_child,beam_best_k=beam_best_k)],
+        structure = model.search_batch_generate([sequence], [GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type,\
+                                                                beam_num_child=beam_num_child,beam_best_k=beam_best_k, beam_warmup_steps=beam_warmup_steps)],
                                                  sample_argmax=sample_argmax, search_type=search_type)[0] 
     elif search_type is None:
         sequence = model.generate(protein, GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type), sample_argmax=sample_argmax)
@@ -163,7 +164,7 @@ def easier_ligand_prompt(pdb_id, given_fraction=0.75):
 
 
 def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_steps, search_type, sample_argmax,\
-                              beam_num_child, beam_best_k, given_fraction=0.8):
+                              beam_num_child, beam_best_k,beam_explore_best_k,beam_warmup_steps, given_fraction=0.8):
     '''
     Returns (pTM, rMSD) of generated structure. 
 
@@ -178,7 +179,9 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
     if search_type is not None and search_type in ['mcts', 'beam', 'tree']:
         # only use search for structure generation for now  
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=sample_argmax) 
-        structure_generation_config = GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type, beam_num_child=beam_num_child,beam_best_k=beam_best_k)
+        structure_generation_config = GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type,\
+                                        beam_num_child=beam_num_child,\
+                                            beam_best_k=beam_best_k,beam_explore_best_k=beam_explore_best_k, beam_warmup_steps=beam_warmup_steps)
         seq_only_structure_protein_prompt = ESMProtein(sequence=sequence_generation.sequence)
         structure_prediction = model.search_batch_generate([sequence_generation], [structure_generation_config],
                                                  sample_argmax=sample_argmax, search_type=search_type)[0] 
@@ -197,7 +200,8 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
     return gen_ptm, crmsd
 
 
-def get_tertiary_coordination(first_k_ligand, num_gen_per_ligand, model, sampling_type, num_steps, search_type, beam_num_child=1, beam_best_k=1, sample_argmax=False):
+def get_tertiary_coordination(first_k_ligand, num_gen_per_ligand, model, sampling_type, num_steps, search_type,\
+                               beam_num_child=1, beam_best_k=1,beam_warmup_steps=0, beam_explore_num_child=1, sample_argmax=False):
     '''
     Returns total sucesss rate across all the k ligands. (total passed / total generated)
 
@@ -219,7 +223,9 @@ def get_tertiary_coordination(first_k_ligand, num_gen_per_ligand, model, samplin
         pdb_id, coord_residues = pdb_id.strip(), coord_residues.strip()
 
         for _ in range(num_gen_per_ligand):
-            pTM, rMSD = run_tertiary_coordination(pdb_id, coord_residues, model, sampling_type, num_steps, search_type,beam_num_child=beam_num_child, beam_best_k=beam_best_k, sample_argmax=sample_argmax)
+            pTM, rMSD = run_tertiary_coordination(pdb_id, coord_residues, model, sampling_type, num_steps, search_type,\
+                            beam_num_child=beam_num_child,beam_explore_num_child=beam_explore_num_child, beam_best_k=beam_best_k,\
+                            beam_warmup_steps=beam_warmup_steps, sample_argmax=sample_argmax)
             ligand_generation_stats[pdb_id].append((pTM, rMSD))
 
     # calculate the total success rate where succeed if pTM > 0.8 and rMSD < 1.5 
@@ -340,13 +346,16 @@ if __name__ == "__main__":
         logging.info(f"First 5 Ligand, 128 generations each. Beam_k={beam_best_k} Num_child={beam_num_child}: success={success_rate} ptm_50/90/99={ptms_percentiles} rmsds_1/10/50={rmsds_percentiles}")
     '''
 
-    for (beam_best_k, beam_num_child) in [(4, 8), (6, 12), (10, 32), (12, 48), (16, 64), (20, 100)]:
+    for (beam_best_k, beam_num_child, beam_explore_best_k) in [(12, 8, 12)]:
         max_ptm, ptms, rmsds = 0, [], []
-        for _ in range(128):
+        for _ in range(32):
             ptm, rmsd = run_tertiary_coordination('8GXP', '', model, sampling_type='random',\
-                                    num_steps=8, search_type=None, sample_argmax=False, beam_num_child=beam_num_child, beam_best_k=beam_best_k, given_fraction=0.5)
+                                    num_steps=8, search_type=None, sample_argmax=False, beam_num_child=beam_num_child,\
+                                    beam_best_k=beam_best_k,beam_explore_best_k=beam_explore_best_k,\
+                                    beam_warmup_steps=4, given_fraction=0.5)
             #structure = uncond_seq_struct_gen(model, 269, sampling_type='random', num_steps=8, search_type=None, sample_argmax=False,\
         #                   beam_num_child=1, beam_best_k=1)
+            print(f"PTM {ptm} and RMSD {rmsd}")
             max_ptm = max(max_ptm, ptm)
             ptms.append(ptm)
             rmsds.append(rmsd)
@@ -355,10 +364,10 @@ if __name__ == "__main__":
 
         ptms_percentiles = np.percentile(ptms, [50,90,99])
         rmsds_percentiles = np.percentile(rmsds, [1,10,50])
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. MaxPTM: ", max_ptm)
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. Ptm50/90/99: ", ptms_percentiles)
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. RMSD1/10/50: ", rmsds_percentiles)
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. Top10ptms: ", both_ptm_rmsd[:10]) 
+        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. MaxPTM: {max_ptm}")
+        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. Ptm50/90/99: {ptms_percentiles}")
+        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. RMSD1/10/50: {rmsds_percentiles}")
+        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. Top10ptms: {both_ptm_rmsd[:10]}") 
 
     breakpoint()
     

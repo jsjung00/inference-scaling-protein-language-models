@@ -313,6 +313,9 @@ class GenerationConfig:
     only_compute_backbone_rmsd: bool = False
     beam_num_child: int =  1 
     beam_best_k: int = 1 
+    beam_explore_best_k: int = 1
+    beam_warmup_steps: int = 0 
+    
 
     def use_entropy_based_unmasking_strategy(self):
         """Use entropy based unmasking strategy during generation."""
