@@ -524,7 +524,7 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
                 score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
                         i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
                         input_tokens, batched_tokens, client)
-                print(f"Timestep {t}: score {score}")
+                #print(f"Timestep {t}: score {score}")
 
             # Iterative sampling by picking the tokens sampled this round
             # from new_track_samples to old_track_samples.
@@ -941,6 +941,8 @@ def search_iterative_sampling_tokens(
             if len(all_children) > 0:
                 top_k_children = sorted(all_children, key=lambda x: x.score, reverse=True)[:beam_best_k]
                 queue.extend(top_k_children)
+
+     
 
         batched_tokens = max(leaf_node_generated_structures, key=lambda x: x.score).batched_tokens
         print(f"Number of NFEs: {nfes}")

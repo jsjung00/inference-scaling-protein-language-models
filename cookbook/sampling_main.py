@@ -91,7 +91,8 @@ def generate_ligand_prompt(pdb_id, coor_residues):
     eval_chain = ProteinChain.from_rcsb(pdb_id, "A") # data currently only single chain    
 
     # first uniformly define length
-    seq_len = random.choice([150,250,350])
+    #seq_len = random.choice([150,250,350])
+    seq_len = random.choice([100])
     seq_prompt_list = list('_' * seq_len)
     structure_prompt = torch.full((seq_len, 37, 3), np.nan)
 
@@ -137,29 +138,29 @@ def generate_ligand_prompt(pdb_id, coor_residues):
     protein_prompt = ESMProtein(sequence=seq_prompt, coordinates=structure_prompt)
     return protein_prompt, target_inds, mobile_inds, eval_chain
 
-def easier_ligand_prompt(pdb_id, given_fraction=0.75):
-    """if we give the model basically the exact answer, does it reproduce it?"""
-    eval_chain = ProteinChain.from_rcsb(pdb_id, "A") # data currently only single chain    
+def easier_ligand_prompt(pdb_id, chain_id='A', motif_inds=None, given_fraction=0.75):
+    """Contiguous motif scaffolding where motif is in the same location as the original protein"""
+    eval_chain = ProteinChain.from_rcsb(pdb_id, chain_id) # data currently only single chain    
     
-    seq_prompt_list = np.array(list(eval_chain.sequence))
-    seq_len = len(seq_prompt_list)
+    seq_len = len(list(eval_chain.sequence))
+    sequence_prompt = np.array(["_"] * seq_len)
 
-    all_indices = np.arange(seq_len)
-    given_indices = np.sort(np.random.choice(all_indices, size=int(given_fraction * seq_len), replace=False))
-    mask = np.ones(seq_len, dtype=bool)
-    mask[given_indices] = False
-    masked_indices = np.where(mask)[0]
+    if motif_inds is None:
+        num_givens = int(seq_len * given_fraction)
+        start_idx = np.random.choice(np.arange(0, seq_len-num_givens))
+        motif_inds = np.arange(start_idx, start_idx+num_givens)
 
-    seq_prompt_list[masked_indices] = "_"
+    motif_seq = eval_chain[motif_inds].sequence   
+    motif_atom37_positions = eval_chain[motif_inds].atom37_positions 
+    
+    sequence_prompt[motif_inds] = list(motif_seq)
+    structure_prompt = torch.full((seq_len, 37, 3), np.nan).float()
+    structure_prompt[motif_inds] = torch.tensor(motif_atom37_positions).float() 
 
-    structure_prompt = torch.tensor(eval_chain.atom37_positions).clone().float()
-    structure_prompt[torch.tensor(masked_indices)] = torch.full((len(masked_indices), 37,3), np.nan)
+    sequence_prompt = ''.join(list(sequence_prompt))
+    mobile_inds, target_inds = list(motif_inds), list(motif_inds)
 
-    seq_prompt = ''.join(list(seq_prompt_list))
-
-    mobile_inds, target_inds = list(given_indices), list(given_indices)
-
-    protein_prompt = ESMProtein(sequence=seq_prompt, coordinates=structure_prompt)
+    protein_prompt = ESMProtein(sequence=sequence_prompt, coordinates=structure_prompt)
     return protein_prompt, target_inds, mobile_inds, eval_chain
 
 
@@ -171,8 +172,8 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
     Params:
         eval_residue: (str) Space separated amino acid sequence contianing coordinating residues 
     '''
-    protein_prompt, target_inds, mobile_inds, eval_chain = easier_ligand_prompt(pdb_id, given_fraction=given_fraction)
-    #protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt(pdb_id, coor_residues)
+    #protein_prompt, target_inds, mobile_inds, eval_chain = easier_ligand_prompt(pdb_id, given_fraction=given_fraction)
+    protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt(pdb_id, coor_residues)
   
     seq_generation_config = GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type)
   
@@ -345,18 +346,40 @@ if __name__ == "__main__":
         rmsds_percentiles = np.percentile(rmsds, [1,10,50])
         logging.info(f"First 5 Ligand, 128 generations each. Beam_k={beam_best_k} Num_child={beam_num_child}: success={success_rate} ptm_50/90/99={ptms_percentiles} rmsds_1/10/50={rmsds_percentiles}")
     '''
+    success = 0 
+    total_samples=1000
+    for _ in range(total_samples):
+        protein_prompt, target_inds, mobile_inds, eval_chain = easier_ligand_prompt('7map',given_fraction=0.1)
+    
+        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
+        sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+        structure_generation_config = GenerationConfig(track="structure", num_steps=8, strategy='random')
+        structure_prediction_prompt = ESMProtein(sequence=sequence_generation.sequence)
+        structure_prediction = model.generate(structure_prediction_prompt, structure_generation_config, sample_argmax=False)
+        gen_ptm = float(structure_prediction.ptm)
+        structure_prediction_chain = structure_prediction.to_protein_chain()
+        structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+        crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+        print(f"PTM {gen_ptm} and RMSD {crmsd}")
+        success += int(gen_ptm > 0.8 and crmsd <1.5)
+    print(f"Success rate {success}/{total_samples}")
 
-    for (beam_best_k, beam_num_child, beam_explore_best_k) in [(12, 8, 12)]:
-        max_ptm, ptms, rmsds = 0, [], []
-        for _ in range(32):
-            ptm, rmsd = run_tertiary_coordination('8GXP', '', model, sampling_type='random',\
-                                    num_steps=8, search_type=None, sample_argmax=False, beam_num_child=beam_num_child,\
+    breakpoint()
+
+
+    for (beam_best_k, beam_num_child, beam_explore_best_k) in [(32, 1, 32)]:
+        max_ptm,min_rmsd, ptms, rmsds = 0,1e10, [], []
+        for i in range(1000000):
+            ptm, rmsd = run_tertiary_coordination('7map', 'D25 G27 A28 D29 D30 G48 G49 V50', model, sampling_type='random',\
+                                    num_steps=64, search_type=None, sample_argmax=False, beam_num_child=beam_num_child,\
                                     beam_best_k=beam_best_k,beam_explore_best_k=beam_explore_best_k,\
-                                    beam_warmup_steps=4, given_fraction=0.5)
+                                    beam_warmup_steps=7, given_fraction=0.5)
             #structure = uncond_seq_struct_gen(model, 269, sampling_type='random', num_steps=8, search_type=None, sample_argmax=False,\
         #                   beam_num_child=1, beam_best_k=1)
-            print(f"PTM {ptm} and RMSD {rmsd}")
+            
             max_ptm = max(max_ptm, ptm)
+            min_rmsd = min(min_rmsd, rmsd)
+            print(f"generation{i} Max PTM {max_ptm} and min RMSD {min_rmsd}")
             ptms.append(ptm)
             rmsds.append(rmsd)
     
@@ -364,12 +387,12 @@ if __name__ == "__main__":
 
         ptms_percentiles = np.percentile(ptms, [50,90,99])
         rmsds_percentiles = np.percentile(rmsds, [1,10,50])
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. MaxPTM: {max_ptm}")
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. Ptm50/90/99: {ptms_percentiles}")
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. RMSD1/10/50: {rmsds_percentiles}")
-        logging.info(f"8GXP, 128 generations. Beam_k={beam_best_k} Num_child={beam_num_child}. Top10ptms: {both_ptm_rmsd[:10]}") 
+        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. MaxPTM: {max_ptm}")
+        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. Ptm50/90/99: {ptms_percentiles}")
+        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. RMSD1/10/50: {rmsds_percentiles}")
+        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. Top10ptms: {both_ptm_rmsd[:10]}") 
 
-    breakpoint()
+
     
 
     #exp = Experiment('uncond_ptm', search_type="beam", strategy='random', num_samples=128, baseline_strategies=[], beam_best_k=8, beam_num_child=8)
