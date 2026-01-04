@@ -4,6 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from esm.models.esm3 import ESM3
 from esm.sdk.api import ESM3InferenceClient, ESMProtein, GenerationConfig
 from esm.utils.structure.protein_chain import ProteinChain
+from esm.utils.generation import generate_structure
 import numpy as np 
 import scipy
 import math  
@@ -15,7 +16,6 @@ from collections import defaultdict
 import random 
 import torch 
 from pathlib import Path 
-import gc 
 
 def uncond_seq_struct_gen(model, seq_len, sampling_type, num_steps, search_type, sample_argmax=False,\
                           beam_num_child=1, beam_best_k=1, beam_warmup_steps=0):
@@ -248,7 +248,7 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
                                                  sample_argmax=sample_argmax, search_type=search_type)[0] 
     elif search_type is None:
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=sample_argmax)
-        structure_prediction = generate_structure(sequence_generation, model, best_of_n=16) 
+        structure_prediction = generate_structure(sequence_generation, model, best_of_n=16, batched_generate=False) 
     else:
         raise ValueError("Search strategy value either None or mcts, beam, tree")
     gen_ptm = float(structure_prediction.ptm)
@@ -389,37 +389,6 @@ class Experiment:
 
         pass 
 
-
-def generate_structure(sequence_obj, model, best_of_n=1, sample_argmax=False):
-    '''
-    Generate the best of n structure from the generated sequence object (only using the sequence information)
-    '''
-
-    structure_generation_config = GenerationConfig(track="structure", num_steps=32, strategy='random')
-    structure_prediction_prompt = ESMProtein(sequence=sequence_obj.sequence)
-    
-    best_structure_prediction, best_ptm_score = None, 0 
-    structure_predictions = model.batch_generate([structure_prediction_prompt]*best_of_n, [structure_generation_config]*best_of_n, sample_argmax=sample_argmax)
-    
-    for i in range(best_of_n):  
-        # TODO: this is painfully slow!!! if we parallelize we get 16x speedup    
-        #structure_prediction = model.generate(structure_prediction_prompt, structure_generation_config, sample_argmax=sample_argmax)
-        structure_prediction = structure_predictions[i]
-        structure_ptm = float(structure_prediction.ptm)
-        if structure_ptm > best_ptm_score:
-            if best_structure_prediction is not None:
-                del best_structure_prediction
-
-            best_ptm_score = structure_ptm
-            best_structure_prediction = structure_prediction
-        else:
-            del structure_prediction
-    
-    del structure_predictions
-    gc.collect()
-    torch.cuda.empty_cache()
-    return best_structure_prediction
-
 def get_fold_std(sequence_obj, model, best_of_n=[8,32,128], num_samples=128, sample_argmax=False):
     '''
     Get the std and mean of best-of-n generated fold score 
@@ -450,16 +419,17 @@ def run_fold_std_experiment(pdb_id='7map'):
     print(best_of_n_score_std)
     print(best_of_n_score_mean)
 
-def run_best_of_n_experiment(model, total_samples=1000):
+def run_best_of_n_experiment(model, total_samples=1000, batched_generate=True):
     '''
     Pass 
     '''
     success = 0 
+    ptms, rmsds = [], [] 
     for i in range(total_samples):
         protein_prompt, target_inds, mobile_inds, eval_chain = medium_ligand_prompt('7map',given_fraction=0.25)
         seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
-        structure_prediction = generate_structure(sequence_generation, model, best_of_n=16)
+        structure_prediction = generate_structure(sequence_generation, model, best_of_n=16, batched_generate=batched_generate)
         
         gen_ptm = float(structure_prediction.ptm)
         structure_prediction_chain = structure_prediction.to_protein_chain()
@@ -467,12 +437,10 @@ def run_best_of_n_experiment(model, total_samples=1000):
         crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
         print(f"sample {i}: PTM {gen_ptm} and RMSD {crmsd}")
         success += int(gen_ptm > 0.8 and crmsd <1.5)
-        del structure_prediction, structure_prediction_chain, sequence_generation
-        del protein_prompt, eval_chain
-        gc.collect()
-        torch.cuda.empty_cache()
+        ptms.append(gen_ptm)
+        rmsds.append(crmsd)
 
-
+    print(f"PTM mean {np.mean(ptms)} and std {np.std(ptms)} and RSMD mean {np.mean(rmsds)} and std {np.std(rmsds)}")
     print(f"Success rate {success}/{total_samples}")
 
 
@@ -521,6 +489,30 @@ def run_orig_order_tertiary_experiment(model):
     print(f"Success rate {success}/{total_samples}")
     pass 
 
+def run_intermediate_sequence_correlation(model, pdb_id='8GXP', coor_residues='W317 C320 A321 H323 V376 F377 L396 I400 H479 Y502',
+                                           total_samples=1000, correlation_file_name='correlation.txt'):
+    '''
+    Calculates the correlation between the intermediate sequence best-of-n fold score and the final generated sequence best-of-n fold score
+    Use the tertiary coordination "generate_ligand_prompt" with place_in_order version to get the seqeunce prompt
+    '''
+    current_file_directory = str(Path(__file__).parent)
+    save_file_path = os.path.join(current_file_directory, correlation_file_name)
+    logger = logging.getLogger("correlation")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        # File handler
+        file_handler = logging.FileHandler(save_file_path)
+        file_handler.setFormatter(logging.Formatter('%(message)s'))
+        logger.addHandler(file_handler)
+
+    for _ in range(total_samples):
+        protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt(pdb_id, coor_residues, place_orig_order=True)
+        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random', run_intermediate_correlation=True,\
+                                                 correlation_data_file_path=save_file_path)
+        sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+     
+     
+
 if __name__ == "__main__":
     logging.basicConfig(
         filename="experiment_beam_tertiary.log",
@@ -535,22 +527,19 @@ if __name__ == "__main__":
         rmsds_percentiles = np.percentile(rmsds, [1,10,50])
         logging.info(f"First 5 Ligand, 128 generations each. Beam_k={beam_best_k} Num_child={beam_num_child}: success={success_rate} ptm_50/90/99={ptms_percentiles} rmsds_1/10/50={rmsds_percentiles}")
     '''
-    start_time = datetime.now()
-    run_best_of_n_experiment(model, total_samples=100)
-    end_time = datetime.now()
-    time_elapsed = end_time - start_time
-    print(f"Time elapsed {time_elapsed}")
+    run_intermediate_sequence_correlation(model)
+    #get_tertiary_coordination(2, 4096, model, sampling_type='random', num_steps=8,\
+    #                          search_type=None)
+    
     breakpoint()
-
-   
+    
     protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt('8GXP', 'W317 C320 A321 H323 V376 F377 L396 I400 H479 Y502', place_orig_order=True)
     seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
     sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
     generate_structure(sequence_generation, model, best_of_n=16, sample_argmax=False)
     
     #run_given_fraction_sweep(model, given_fractions=[0.25], total_samples=128)
-    #get_tertiary_coordination(1, 1000, model, sampling_type='random', num_steps=8,\
-    #                          search_type=None)
+    #
 
     # next todo: figure out what is a fair n to have the maximum fold score be representative. Hoping 8 is fine
     # then, run the best of N code below. you can refactor this pretty easily. you should also for loop over PDB ids.  
@@ -581,8 +570,6 @@ if __name__ == "__main__":
         logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. RMSD1/10/50: {rmsds_percentiles}")
         logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. Top10ptms: {both_ptm_rmsd[:10]}") 
     '''
-
-    
 
     #exp = Experiment('uncond_ptm', search_type="beam", strategy='random', num_samples=128, baseline_strategies=[], beam_best_k=8, beam_num_child=8)
     #exp.sweep([8], [256], [8])

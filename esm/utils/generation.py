@@ -449,7 +449,8 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
         # TODO: downstream utils work with batch dimsension.
         # Group by sampling configurations and sample those prompts together.
         if batched_sample:
-            # assume no errors. TODO: add subsampling
+            # assume no errors. TODO: add subsampling.
+            # Batched sampling gets slightly lower pTM mean... still within CI though. Confirm identical behavior for b > 1
             valid_indices = [i for i in range(len(configs)) if i not in errors]
             assert len(valid_indices) == len(configs)
 
@@ -515,6 +516,13 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
             where_to_sample.to(input_tokens[0].device)
             old_track_samples = getattr(per_prompt_cur_sampled, config.track)
             new_track_samples = getattr(per_prompt_new_sampled, config.track)
+            if config.run_intermediate_correlation:
+                score = get_lookahead_ptm(config.track == 'sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                        i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
+                        input_tokens, batched_tokens, client, structure_best_of_n=16)
+                logger = logging.getLogger("correlation")
+                logger.info(f"Timestep {t}: score {score}")
+
             new_track_samples = torch.where(
                 where_to_sample, new_track_samples, old_track_samples
             )
@@ -610,11 +618,12 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
 
                 old_track_samples = getattr(per_prompt_cur_sampled, config.track)
                 new_track_samples = getattr(per_prompt_new_sampled, config.track)
-                #if config.track == "structure":
-                #    score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
-                #            i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
-                #            input_tokens, batched_tokens, client)
-                    #print(f"Timestep {t}: score {score}")
+                if config.run_intermediate_correlation:
+                    score = get_lookahead_ptm(config.track == 'sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                            i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
+                            input_tokens, batched_tokens, client, structure_best_of_n=16)
+                    logger = logging.getLogger("correlation")
+                    logger.info(f"Timestep {t}: score {score}")
 
                 # Iterative sampling by picking the tokens sampled this round
                 # from new_track_samples to old_track_samples.
@@ -638,13 +647,11 @@ def iterative_sampling_tokens(
     
     sampled_tokens = [attr.evolve(tokens) for tokens in input_tokens]
 
-
     # Clear structure tokens if user would like to condition only on coordinates.
     for tokens, config in zip(sampled_tokens, configs):
         if config.condition_on_coordinates_only and tokens.coordinates is not None:
             tokens.structure = None
     
-
     # Total sequence lengths.
     sequence_lengths = [len(tokens) for tokens in sampled_tokens]
     # Figure out the number of tokens to be sampled for each prompt.
@@ -684,7 +691,7 @@ def iterative_sampling_tokens(
     # Decode
     disable_tqdm = bool(os.environ.get("DISABLE_ITERATIVE_SAMPLING_TQDM", False))
     run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, errors,
-                tokenizers, sample_argmax,sequence_lengths,total_to_sample, input_tokens)
+                tokenizers, sample_argmax,sequence_lengths,total_to_sample, input_tokens, batched_sample=len(configs)>1)
     
     # Un-pack to a list of single ProteinTypes.
     output_tokens = [
@@ -718,9 +725,12 @@ class BeamChild:
     t: int 
     score: Optional[float]
 
-def get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+def get_lookahead_ptm(from_sequence, per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
                        i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
-                       input_tokens, batched_tokens, client):
+                       input_tokens, batched_tokens, client, structure_best_of_n):
+    '''
+    from_sequence: (bool) Input is sequence, so we generate a fold from the denoised sequence. Else assume that input is a structure, so we get pTM from the structure
+    '''
     try:
         all_where_to_sample = _get_all_denoise_sampling_mask(
             per_prompt_cur_sampled,
@@ -749,10 +759,17 @@ def get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_sampl
         for i in range(len(input_tokens))
     ]
     lookahead_protein = client.decode(lookahead_output_tokens[0])
-    if lookahead_protein.ptm:
-        score = lookahead_protein.ptm.item()  
-        return score 
-    return None 
+    if from_sequence:
+        best_of_n_structure = generate_structure(lookahead_protein, client, best_of_n=structure_best_of_n, batched_generate=False) 
+        if best_of_n_structure.ptm:
+            score = best_of_n_structure.ptm.item()
+            return score 
+        return None 
+    else:
+        if lookahead_protein.ptm:
+            score = lookahead_protein.ptm.item()  
+            return score 
+        return None 
 
 def search_iterative_sampling_tokens(
     client: ESM3InferenceClient,
@@ -919,12 +936,11 @@ def search_iterative_sampling_tokens(
             # Iterative sampling by picking the tokens sampled this round
             # from new_track_samples to old_track_samples.
             old_track_samples = getattr(per_prompt_cur_sampled, config.track)
-            if config.track == "structure":
-                score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
-                        i, t, per_prompt_forward_and_sample_output, config, tokenizers, input_tokens, batched_tokens, client)
-                print(f"Child score {score}")
-                if score is None:
-                    raise ValueError("Error ocurred, failed to get score") 
+            score = get_lookahead_ptm(config.track=='sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                    i, t, per_prompt_forward_and_sample_output, config, tokenizers, input_tokens, batched_tokens, client, structure_best_of_n=16)
+            print(f"Child score {score}")
+            if score is None:
+                raise ValueError("Error ocurred, failed to get score") 
 
             new_track_samples = torch.where(
                 where_to_sample, new_track_samples, old_track_samples
@@ -1170,6 +1186,30 @@ def search_iterative_sampling_tokens(
                 setattr(outputs, f.name, getattr(inputs, f.name))
 
     return output_tokens
+
+def generate_structure(sequence_obj, model, best_of_n=1, sample_argmax=False, batched_generate=True):
+    '''
+    Generate the best of n structure from the generated sequence object (only using the sequence information)
+    '''
+
+    structure_generation_config = GenerationConfig(track="structure", num_steps=32, strategy='random')
+    structure_prediction_prompt = ESMProtein(sequence=sequence_obj.sequence)
+    
+    best_structure_prediction, best_ptm_score = None, 0 
+    if batched_generate:
+        structure_predictions = model.batch_generate([structure_prediction_prompt]*best_of_n, [structure_generation_config]*best_of_n, sample_argmax=sample_argmax)
+    
+    for i in range(best_of_n):  
+        if batched_generate:
+            structure_prediction = structure_predictions[i]
+        else:
+            structure_prediction = model.generate(structure_prediction_prompt, structure_generation_config, sample_argmax=sample_argmax)
+        
+        structure_ptm = float(structure_prediction.ptm)
+        if structure_ptm > best_ptm_score:
+            best_ptm_score = structure_ptm
+            best_structure_prediction = structure_prediction
+    return best_structure_prediction
 
 
 def _batch_forward(client: ESM3InferenceClient, protein: _BatchedESMProteinTensor):

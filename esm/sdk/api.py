@@ -315,7 +315,10 @@ class GenerationConfig:
     beam_best_k: int = 1 
     beam_explore_best_k: int = 1
     beam_warmup_steps: int = 0 
-    
+
+    # for the intemediate correlation experiment
+    run_intermediate_correlation: bool = False 
+    correlation_data_file_path: str = 'correlation.txt'
 
     def use_entropy_based_unmasking_strategy(self):
         """Use entropy based unmasking strategy during generation."""
