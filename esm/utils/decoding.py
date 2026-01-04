@@ -161,8 +161,14 @@ def decode_structure(
         plddt = plddt[0, 1:-1].detach().cpu()
 
     ptm = decoder_output.get("ptm", None)
+    if ptm is not None:
+        ptm = ptm.detach().cpu()  
 
     pae = decoder_output.get("predicted_aligned_error", None)
+    if pae is not None:
+        pae = pae.detach().cpu()  
+    del decoder_output 
+    torch.cuda.empty_cache()  
 
     chain = ProteinChain.from_backbone_atom_coordinates(bb_coords, sequence=sequence)
     chain = chain.infer_oxygen()

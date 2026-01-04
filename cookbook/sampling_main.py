@@ -15,6 +15,7 @@ from collections import defaultdict
 import random 
 import torch 
 from pathlib import Path 
+import gc 
 
 def uncond_seq_struct_gen(model, seq_len, sampling_type, num_steps, search_type, sample_argmax=False,\
                           beam_num_child=1, beam_best_k=1, beam_warmup_steps=0):
@@ -48,7 +49,8 @@ def get_ptm_scores(num_samples, model, seq_len, sampling_type, num_steps, search
 
 def place_spans(span_lengths, total_length):
     """
-    Randomly place non-overlapping spans.
+    Randomly place non-overlapping spans. Else, insert in the same location order.
+
     Returns starting positions for each span. In same order as original span lengths. 
     """
     n_spans = len(span_lengths)
@@ -81,24 +83,50 @@ def place_spans(span_lengths, total_length):
     
     return positions
 
-def generate_ligand_prompt(pdb_id, coor_residues):
+def generate_ligand_prompt(pdb_id, coor_residues, chain_id='A', place_orig_order=False):
     '''
+    Generates a ligand prompt as in the challenging tertiary coordination task in the ESM3 paper 
+
     Return ESMProtein(sequence=sequence_prompt, coordinates=structure_prompt), target_inds, mobile_inds, eval_chain
         target_inds: indices of residues in the actual pdb protein chain 
         mobile_inds: indices of residues in the generating prompt
         eval_chain: ProteinChain of the pdb_id 
+
+    Params:
+        place_orig_order: (bool) If true just mask original protein chain residues not in coor_residues
+        
+        use_orig_len: (bool) If true set scaffold sequence length to original chain length
+        shuffle_spans: (bool) If true shuffle the span insertion location as in the original task 
     '''
-    eval_chain = ProteinChain.from_rcsb(pdb_id, "A") # data currently only single chain    
+    eval_chain = ProteinChain.from_rcsb(pdb_id, chain_id) # data currently only single chain    
 
     # first uniformly define length
-    #seq_len = random.choice([150,250,350])
-    seq_len = random.choice([100])
-    seq_prompt_list = list('_' * seq_len)
-    structure_prompt = torch.full((seq_len, 37, 3), np.nan)
+    if place_orig_order:
+        seq_len = len(eval_chain)
+    else:
+        seq_len = random.choice([150,250,350])
 
-    # randomly insert residue spans 
+    seq_prompt_list = list('_' * seq_len)
+    structure_prompt = torch.full((seq_len, 37, 3), np.nan).float()
+    target_inds, mobile_inds = [], []
     residues = coor_residues.split(" ")
     residues_formatted = [(chr[0], int(chr[1:])) for chr in residues] #List of (Residue letter, position)
+
+    if place_orig_order:
+        for (letter, position) in residues_formatted:
+            prompt_idx = eval_chain.residue_index.tolist().index(position)
+            mobile_inds.append(prompt_idx)
+            seq_prompt_list[prompt_idx] = letter 
+            assert seq_prompt_list[prompt_idx] == eval_chain.sequence[prompt_idx]
+        target_inds = mobile_inds
+        motif = eval_chain[np.array(mobile_inds)]
+        motif_atom37_positions = motif.atom37_positions 
+        structure_prompt[np.array(mobile_inds)] = torch.tensor(motif_atom37_positions).float()
+        seq_prompt = ''.join(seq_prompt_list)
+        protein_prompt = ESMProtein(sequence=seq_prompt, coordinates=structure_prompt)
+        return protein_prompt, target_inds, mobile_inds, eval_chain
+
+    # randomly insert residue spans 
     residue_spans = []
     current_span = [residues_formatted[0]]
 
@@ -116,8 +144,7 @@ def generate_ligand_prompt(pdb_id, coor_residues):
  
     span_lengths = [(span[-1][1]-span[0][1]+1) for span in residue_spans]
     span_start_indices = place_spans(span_lengths, seq_len)
-
-    target_inds, mobile_inds = [], []
+    
 
     for i in range(len(residue_spans)):
         span = residue_spans[i]
@@ -163,9 +190,40 @@ def easier_ligand_prompt(pdb_id, chain_id='A', motif_inds=None, given_fraction=0
     protein_prompt = ESMProtein(sequence=sequence_prompt, coordinates=structure_prompt)
     return protein_prompt, target_inds, mobile_inds, eval_chain
 
+def medium_ligand_prompt(pdb_id, chain_id='A', motif_inds=None, given_fraction=0.75):
+    """
+    Contiguous motif scaffolding where contiguous block motif is inserted randomly into starting partially masked sequence
+        Randomly choose a block from the chain to define the motif
+        Randomly choose an insert location in the prompt sequence
+        Define the prompt sequence to be either length 150, 250, or 350
+    """
+    eval_chain = ProteinChain.from_rcsb(pdb_id, chain_id) # data currently only single chain    
+    prompt_seq_len = random.choice([150,250,350])
+    sequence_prompt = np.array(["_"] * prompt_seq_len)
+    motif_seq_len = len(eval_chain) 
+
+    if motif_inds is None:
+        num_givens = int(min(prompt_seq_len, motif_seq_len) * given_fraction)
+        motif_start_idx = np.random.choice(np.arange(0, motif_seq_len-num_givens))
+        motif_inds = np.arange(motif_start_idx, motif_start_idx+num_givens)    
+        insert_start_idx = np.random.choice(np.arange(0, prompt_seq_len-num_givens))
+        insert_inds = np.arange(insert_start_idx, insert_start_idx+num_givens)
+
+    motif_seq = eval_chain[motif_inds].sequence   
+    motif_atom37_positions = eval_chain[motif_inds].atom37_positions 
+    
+    sequence_prompt[insert_inds] = list(motif_seq)
+    structure_prompt = torch.full((prompt_seq_len, 37, 3), np.nan).float()
+    structure_prompt[insert_inds] = torch.tensor(motif_atom37_positions).float() 
+
+    sequence_prompt = ''.join(list(sequence_prompt))
+    mobile_inds, target_inds = [int(elm) for elm in insert_inds], [int(elm) for elm in motif_inds]
+    protein_prompt = ESMProtein(sequence=sequence_prompt, coordinates=structure_prompt)
+    return protein_prompt, target_inds, mobile_inds, eval_chain
+
 
 def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_steps, search_type, sample_argmax,\
-                              beam_num_child, beam_best_k,beam_explore_best_k,beam_warmup_steps, given_fraction=0.8):
+                              beam_num_child, beam_best_k,beam_explore_best_k,beam_warmup_steps):
     '''
     Returns (pTM, rMSD) of generated structure. 
 
@@ -173,11 +231,13 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
         eval_residue: (str) Space separated amino acid sequence contianing coordinating residues 
     '''
     #protein_prompt, target_inds, mobile_inds, eval_chain = easier_ligand_prompt(pdb_id, given_fraction=given_fraction)
-    protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt(pdb_id, coor_residues)
+    protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt(pdb_id, coor_residues, place_orig_order=True)
   
     seq_generation_config = GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type)
   
     if search_type is not None and search_type in ['mcts', 'beam', 'tree']:
+        # TODO: FIX 
+        raise ValueError("Search should be on sequence!!")
         # only use search for structure generation for now  
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=sample_argmax) 
         structure_generation_config = GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type,\
@@ -188,9 +248,7 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
                                                  sample_argmax=sample_argmax, search_type=search_type)[0] 
     elif search_type is None:
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=sample_argmax)
-        structure_generation_config = GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type)
-        seq_only_structure_protein_prompt = ESMProtein(sequence=sequence_generation.sequence)
-        structure_prediction = model.generate(sequence_generation, structure_generation_config, sample_argmax=sample_argmax) 
+        structure_prediction = generate_structure(sequence_generation, model, best_of_n=16) 
     else:
         raise ValueError("Search strategy value either None or mcts, beam, tree")
     gen_ptm = float(structure_prediction.ptm)
@@ -202,7 +260,7 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
 
 
 def get_tertiary_coordination(first_k_ligand, num_gen_per_ligand, model, sampling_type, num_steps, search_type,\
-                               beam_num_child=1, beam_best_k=1,beam_warmup_steps=0, beam_explore_num_child=1, sample_argmax=False):
+                               beam_num_child=1, beam_best_k=1,beam_warmup_steps=0, beam_explore_best_k=1, sample_argmax=False):
     '''
     Returns total sucesss rate across all the k ligands. (total passed / total generated)
 
@@ -222,11 +280,14 @@ def get_tertiary_coordination(first_k_ligand, num_gen_per_ligand, model, samplin
         eval_residue_line = eval_residue_data[k]
         pdb_id, coord_residues = eval_residue_line.split("|")[0], eval_residue_line.split("|")[1]  
         pdb_id, coord_residues = pdb_id.strip(), coord_residues.strip()
-
-        for _ in range(num_gen_per_ligand):
+        success = 0
+        for i in range(num_gen_per_ligand):
             pTM, rMSD = run_tertiary_coordination(pdb_id, coord_residues, model, sampling_type, num_steps, search_type,\
-                            beam_num_child=beam_num_child,beam_explore_num_child=beam_explore_num_child, beam_best_k=beam_best_k,\
+                            beam_num_child=beam_num_child, beam_best_k=beam_best_k, beam_explore_best_k=beam_explore_best_k, 
                             beam_warmup_steps=beam_warmup_steps, sample_argmax=sample_argmax)
+            print(f"Ligand {pdb_id} PTM {pTM} rMSD {rMSD}")
+            success += int(pTM > 0.8 and rMSD < 1.5)
+            print(f"Ligand {pdb_id} success rate so far {success} / {i+1}")
             ligand_generation_stats[pdb_id].append((pTM, rMSD))
 
     # calculate the total success rate where succeed if pTM > 0.8 and rMSD < 1.5 
@@ -329,8 +390,136 @@ class Experiment:
         pass 
 
 
+def generate_structure(sequence_obj, model, best_of_n=1, sample_argmax=False):
+    '''
+    Generate the best of n structure from the generated sequence object (only using the sequence information)
+    '''
+
+    structure_generation_config = GenerationConfig(track="structure", num_steps=32, strategy='random')
+    structure_prediction_prompt = ESMProtein(sequence=sequence_obj.sequence)
+    
+    best_structure_prediction, best_ptm_score = None, 0 
+    structure_predictions = model.batch_generate([structure_prediction_prompt]*best_of_n, [structure_generation_config]*best_of_n, sample_argmax=sample_argmax)
+    
+    for i in range(best_of_n):  
+        # TODO: this is painfully slow!!! if we parallelize we get 16x speedup    
+        #structure_prediction = model.generate(structure_prediction_prompt, structure_generation_config, sample_argmax=sample_argmax)
+        structure_prediction = structure_predictions[i]
+        structure_ptm = float(structure_prediction.ptm)
+        if structure_ptm > best_ptm_score:
+            if best_structure_prediction is not None:
+                del best_structure_prediction
+
+            best_ptm_score = structure_ptm
+            best_structure_prediction = structure_prediction
+        else:
+            del structure_prediction
+    
+    del structure_predictions
+    gc.collect()
+    torch.cuda.empty_cache()
+    return best_structure_prediction
+
+def get_fold_std(sequence_obj, model, best_of_n=[8,32,128], num_samples=128, sample_argmax=False):
+    '''
+    Get the std and mean of best-of-n generated fold score 
+    '''
+    best_of_n_score_std = {k: None for k in best_of_n} #key: n in best-of-n, value: variance of best-of-n score
+    best_of_n_score_mean = {k: None for k in best_of_n}
+    for n in best_of_n:
+        best_fold_scores = []
+        for _ in range(num_samples):
+            best_structure = generate_structure(sequence_obj, model, best_of_n=n, sample_argmax=sample_argmax)
+            best_of_n_ptm = float(best_structure.ptm)
+            best_fold_scores.append(best_of_n_ptm)
+        best_fold_scores = np.array(best_fold_scores)
+        mean, std = np.mean(best_fold_scores), np.std(best_fold_scores)
+        best_of_n_score_mean[n] = mean 
+        best_of_n_score_std[n] = std 
+        print(f"BestofN={n} Mean: {mean}, Std: {std}")
+    
+    return best_of_n_score_std, best_of_n_score_mean
 
 
+### misc experiment drivers ###
+def run_fold_std_experiment(pdb_id='7map'):
+    protein_prompt, target_inds, mobile_inds, eval_chain = medium_ligand_prompt(pdb_id, given_fraction=0.25)
+    seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
+    sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+    best_of_n_score_std, best_of_n_score_mean = get_fold_std(sequence_generation, model, best_of_n=[16])
+    print(best_of_n_score_std)
+    print(best_of_n_score_mean)
+
+def run_best_of_n_experiment(model, total_samples=1000):
+    '''
+    Pass 
+    '''
+    success = 0 
+    for i in range(total_samples):
+        protein_prompt, target_inds, mobile_inds, eval_chain = medium_ligand_prompt('7map',given_fraction=0.25)
+        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
+        sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+        structure_prediction = generate_structure(sequence_generation, model, best_of_n=16)
+        
+        gen_ptm = float(structure_prediction.ptm)
+        structure_prediction_chain = structure_prediction.to_protein_chain()
+        structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+        crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+        print(f"sample {i}: PTM {gen_ptm} and RMSD {crmsd}")
+        success += int(gen_ptm > 0.8 and crmsd <1.5)
+        del structure_prediction, structure_prediction_chain, sequence_generation
+        del protein_prompt, eval_chain
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+    print(f"Success rate {success}/{total_samples}")
+
+
+def run_given_fraction_sweep(model, given_fractions=[0.05, 0.1, 0.25], total_samples=32, pdb_id='7map'):
+    '''
+    Experiment to determine what a reasonable given fraction is to make the medium ligand prompt scaffold generation problem 
+        reasonably difficult. 
+    '''
+    success_rate_per_fraction = defaultdict(float)
+    for given_fraction in given_fractions:
+        success = 0 
+        for i in range(total_samples):
+            protein_prompt, target_inds, mobile_inds, eval_chain = medium_ligand_prompt(pdb_id, given_fraction=given_fraction)
+            seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
+            sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+            structure_prediction = generate_structure(sequence_generation, model, best_of_n=16)
+            gen_ptm = float(structure_prediction.ptm)
+            structure_prediction_chain = structure_prediction.to_protein_chain()
+            structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+            crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+            print(f"PTM {gen_ptm} and RMSD {crmsd}")
+            success += int(gen_ptm > 0.8 and crmsd <1.5)
+            print(f"Givenfraction={given_fraction}. Success rate so far {success} / {i+1}")
+
+        success_rate = success/total_samples
+        success_rate_per_fraction[given_fraction] = success_rate
+
+        print(f"Given fraction={given_fraction} has success rate {success} / {total_samples}")
+    return success_rate_per_fraction
+
+def run_orig_order_tertiary_experiment(model):
+    success = 0 
+    total_samples=10000
+    for _ in range(total_samples):
+        protein_prompt, target_inds, mobile_inds, eval_chain = medium_ligand_prompt('7map',given_fraction=0.25)
+        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
+        sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+        structure_prediction = generate_structure(sequence_generation, model, best_of_n=8)
+        
+        gen_ptm = float(structure_prediction.ptm)
+        structure_prediction_chain = structure_prediction.to_protein_chain()
+        structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+        crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+        print(f"PTM {gen_ptm} and RMSD {crmsd}")
+        success += int(gen_ptm > 0.8 and crmsd <1.5)
+    print(f"Success rate {success}/{total_samples}")
+    pass 
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -346,27 +535,27 @@ if __name__ == "__main__":
         rmsds_percentiles = np.percentile(rmsds, [1,10,50])
         logging.info(f"First 5 Ligand, 128 generations each. Beam_k={beam_best_k} Num_child={beam_num_child}: success={success_rate} ptm_50/90/99={ptms_percentiles} rmsds_1/10/50={rmsds_percentiles}")
     '''
-    success = 0 
-    total_samples=1000
-    for _ in range(total_samples):
-        protein_prompt, target_inds, mobile_inds, eval_chain = easier_ligand_prompt('7map',given_fraction=0.1)
-    
-        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
-        sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
-        structure_generation_config = GenerationConfig(track="structure", num_steps=8, strategy='random')
-        structure_prediction_prompt = ESMProtein(sequence=sequence_generation.sequence)
-        structure_prediction = model.generate(structure_prediction_prompt, structure_generation_config, sample_argmax=False)
-        gen_ptm = float(structure_prediction.ptm)
-        structure_prediction_chain = structure_prediction.to_protein_chain()
-        structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
-        crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
-        print(f"PTM {gen_ptm} and RMSD {crmsd}")
-        success += int(gen_ptm > 0.8 and crmsd <1.5)
-    print(f"Success rate {success}/{total_samples}")
-
+    start_time = datetime.now()
+    run_best_of_n_experiment(model, total_samples=100)
+    end_time = datetime.now()
+    time_elapsed = end_time - start_time
+    print(f"Time elapsed {time_elapsed}")
     breakpoint()
 
+   
+    protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt('8GXP', 'W317 C320 A321 H323 V376 F377 L396 I400 H479 Y502', place_orig_order=True)
+    seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
+    sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+    generate_structure(sequence_generation, model, best_of_n=16, sample_argmax=False)
+    
+    #run_given_fraction_sweep(model, given_fractions=[0.25], total_samples=128)
+    #get_tertiary_coordination(1, 1000, model, sampling_type='random', num_steps=8,\
+    #                          search_type=None)
 
+    # next todo: figure out what is a fair n to have the maximum fold score be representative. Hoping 8 is fine
+    # then, run the best of N code below. you can refactor this pretty easily. you should also for loop over PDB ids.  
+
+    '''
     for (beam_best_k, beam_num_child, beam_explore_best_k) in [(32, 1, 32)]:
         max_ptm,min_rmsd, ptms, rmsds = 0,1e10, [], []
         for i in range(1000000):
@@ -391,7 +580,7 @@ if __name__ == "__main__":
         logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. Ptm50/90/99: {ptms_percentiles}")
         logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. RMSD1/10/50: {rmsds_percentiles}")
         logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. Top10ptms: {both_ptm_rmsd[:10]}") 
-
+    '''
 
     
 

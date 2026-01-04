@@ -9,6 +9,7 @@ import torch
 import numpy as np 
 from tqdm import tqdm
 import json 
+import random 
 import logging 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +319,7 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
     # TODO: figure out why we want this function to work with
     # _BatchedESMProteinTensor in the first place. Logics below
     # don't really work for batched tensors.
-    assert B == 1
+    #assert B == 1
 
     sampling_mask = torch.ones((B, L), dtype=torch.bool, device=device)
     sampling_mask[:, 0] = False  # BOS
@@ -337,8 +338,9 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
     # Initialize schedule and masks
     decoding_schedule = NOISE_SCHEDULE_REGISTRY[config.schedule]
 
-    # Calculate number of tokens to sample
-    still_masked = torch.sum(sampling_mask).int()
+    # Calculate number of tokens to sample 
+    still_masked = torch.sum(sampling_mask).int() // B
+
     perc_masked_after_this_step = decoding_schedule(
         torch.tensor((step + 1) / config.num_steps)
     )
@@ -352,6 +354,7 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
     num_to_sample = still_masked - num_tokens_masked_after_this_step
 
     if config.strategy == "entropy":
+        # TODO: add batching
         track_entropy: torch.Tensor = getattr(entropy, track_to_sample).to(
             device
         )  # (B, L) or (B, L, D)
@@ -368,6 +371,7 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
         )
         where_to_sample = sampling_mask & is_top_k
     elif config.strategy == "top_margin":
+        # TODO: add batching
         track_entropy = getattr(entropy, track_to_sample).to(device)
         track_all_logprobs = getattr(all_logprobs, track_to_sample).to(device)
         #all_probs = torch.exp(track_all_logprobs) we use the difference in log probability for now 
@@ -381,6 +385,18 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
         )
         where_to_sample = sampling_mask & is_top_k
     elif config.strategy == "random":
+        # fix to allow batching 
+        B,L = sampling_mask.shape 
+        rand = torch.rand(B,L, device=sampling_mask.device)
+        rand = torch.where(sampling_mask, rand, torch.tensor(float('inf'), device=sampling_mask.device))
+        _, indices = rand.topk(num_to_sample, dim=1, largest=False) #(B, num_to_sample)
+
+        rnd_mask = torch.zeros_like(sampling_mask)
+        rnd_mask.scatter_(1, indices, True)
+        where_to_sample = sampling_mask & rnd_mask
+        '''
+        masked_indices = sampling_mask.nonzero(as_tuple=False)
+        rnd_indices = masked_indices[:, torch.randperm(masked_indices.shape[1])][:, :num_to_sample]
         # Skip B since we know there is only 1 prompt here.
         _, masked_indices = sampling_mask.nonzero(as_tuple=True)
         # Random shuffle the masked indices then select the first num_to_sample.
@@ -390,7 +406,7 @@ def _get_iterative_sampling_mask_for_prompt_and_step(
         rnd_mask = torch.zeros_like(sampling_mask)
         rnd_mask[:, rnd_indices] = True
         where_to_sample = sampling_mask & rnd_mask
-
+        '''
     if track_to_sample == "function":
         where_to_sample = where_to_sample.unsqueeze(-1).expand(
             B, L, tokenizers.function.depth
@@ -422,40 +438,29 @@ def _get_annealed_temperature(step: int, num_steps: int, initial_temperature: fl
 
 
 def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, errors,
-                tokenizers, sample_argmax,sequence_lengths,total_to_sample, input_tokens):
+                tokenizers, sample_argmax,sequence_lengths,total_to_sample, input_tokens, batched_sample=True):
     '''
     Run for max_num_steps iterations and update batched_tokens in place 
     '''
     for t in tqdm(range(max_num_steps), disable=disable_tqdm):
         forward_out = _batch_forward(client, batched_tokens)
-
         # Sample each prompt individually, since their configuration may
         # be very different.
         # TODO: downstream utils work with batch dimsension.
         # Group by sampling configurations and sample those prompts together.
-        for i, config in enumerate(configs):  # B
-            if i in errors:
-                # This prompts has errored out in previous steps.
-                # Skip.
-                continue
+        if batched_sample:
+            # assume no errors. TODO: add subsampling
+            valid_indices = [i for i in range(len(configs)) if i not in errors]
+            assert len(valid_indices) == len(configs)
 
-            if config.track in ["coordinates", "residue_annotations"]:
-                errors[i] = ESMProteinError(
-                    error_code=500,
-                    error_msg=f"Iterative sampling {config.track} is not supported.",
-                )
-                continue
+            config = configs[0]
 
             if t >= config.num_steps:
                 # Done sampling for this row.
                 continue
 
-            per_prompt_cur_sampled = _BatchedESMProteinTensor.from_protein_tensor(
-                batched_tokens.slice(i)
-            )
-            per_prompt_forward_out: LogitsOutput = _slice_tensor_dataclass(
-                forward_out, i, keep_dim=True
-            )
+            per_prompt_cur_sampled = batched_tokens
+            per_prompt_forward_out = forward_out
             # Trim logits to proper sequence length for this prompt.
             per_prompt_forward_out = _trim_sequence_tensor_dataclass(
                 per_prompt_forward_out,
@@ -467,7 +472,6 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
                 # BatchedESM3ModelRunner (where per_prompt_cur_sampled is not padded).
                 len(per_prompt_cur_sampled),
             )
-
             # Handle temperature annealing, since _sample_per_prompt() doesn't have
             # the concept of decoding steps.
             if config.temperature_annealing:
@@ -476,15 +480,12 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
                 )
             else:
                 temperature = config.temperature
-
+            
             track_sample_config = SamplingTrackConfig()
             track_sample_config.invalid_ids = config.invalid_ids
             track_sample_config.temperature = temperature
             track_sample_config.top_p = config.top_p
             sampling_config = SamplingConfig(**{config.track: track_sample_config})  # type: ignore
-
-            # Sampling has to be done per-prompt, since sampling configs
-            # are likely be different for different prompts.
             per_prompt_forward_and_sample_output = _sample_per_prompt(
                 per_prompt_cur_sampled,
                 per_prompt_forward_out,
@@ -493,19 +494,14 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
                 decode_sasa_tokens=False,
                 sample_argmax=sample_argmax
             )
-
-            # All positions sampled after _sample_per_prompt() above.
-            # (B, L) & (B, L, D)
             per_prompt_new_sampled = per_prompt_forward_and_sample_output.protein_tensor
-
-            # Find the positions we should sample this round.
             assert per_prompt_forward_and_sample_output.entropy is not None
             assert per_prompt_forward_and_sample_output.all_logprob is not None 
             try:
                 where_to_sample = _get_iterative_sampling_mask_for_prompt_and_step(
                     per_prompt_cur_sampled,
-                    torch.tensor(sequence_lengths[i]),
-                    torch.tensor(total_to_sample[i]),
+                    torch.tensor(sequence_lengths[0]),
+                    torch.tensor(total_to_sample[0]),
                     t,
                     per_prompt_forward_and_sample_output.entropy,
                     config,
@@ -515,25 +511,119 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
             except ValueError as e:
                 errors[i] = ESMProteinError(error_code=500, error_msg=str(e))
                 continue
-
+            
             where_to_sample.to(input_tokens[0].device)
-
             old_track_samples = getattr(per_prompt_cur_sampled, config.track)
             new_track_samples = getattr(per_prompt_new_sampled, config.track)
-            if config.track == "structure":
-                score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
-                        i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
-                        input_tokens, batched_tokens, client)
-                #print(f"Timestep {t}: score {score}")
-
-            # Iterative sampling by picking the tokens sampled this round
-            # from new_track_samples to old_track_samples.
             new_track_samples = torch.where(
                 where_to_sample, new_track_samples, old_track_samples
             )
-            
+
             # Update the corresponding row with new data.
-            getattr(batched_tokens, config.track)[i, ...] = new_track_samples[0]
+            getattr(batched_tokens, config.track)[...] = new_track_samples[0]
+
+        else:
+            for i, config in enumerate(configs):  # B
+                if i in errors:
+                    # This prompts has errored out in previous steps.
+                    # Skip.
+                    continue
+
+                if config.track in ["coordinates", "residue_annotations"]:
+                    errors[i] = ESMProteinError(
+                        error_code=500,
+                        error_msg=f"Iterative sampling {config.track} is not supported.",
+                    )
+                    continue
+
+                if t >= config.num_steps:
+                    # Done sampling for this row.
+                    continue
+
+                per_prompt_cur_sampled = _BatchedESMProteinTensor.from_protein_tensor(
+                    batched_tokens.slice(i)
+                )
+                per_prompt_forward_out: LogitsOutput = _slice_tensor_dataclass(
+                    forward_out, i, keep_dim=True
+                )
+                # Trim logits to proper sequence length for this prompt.
+                per_prompt_forward_out = _trim_sequence_tensor_dataclass(
+                    per_prompt_forward_out,
+                    # Note(jungong) : we can not smiply use sequence_lenths[i] here,
+                    # what we want is for the sequence length of the logits to match
+                    # that of the prompt, which may or may not be padded, depending on
+                    # whether the padding was done locally with the open source model
+                    # (where per_prompt_cur_sampled is already padded) or by
+                    # BatchedESM3ModelRunner (where per_prompt_cur_sampled is not padded).
+                    len(per_prompt_cur_sampled),
+                )
+
+                # Handle temperature annealing, since _sample_per_prompt() doesn't have
+                # the concept of decoding steps.
+                if config.temperature_annealing:
+                    temperature = _get_annealed_temperature(
+                        t, config.num_steps, config.temperature
+                    )
+                else:
+                    temperature = config.temperature
+
+                track_sample_config = SamplingTrackConfig()
+                track_sample_config.invalid_ids = config.invalid_ids
+                track_sample_config.temperature = temperature
+                track_sample_config.top_p = config.top_p
+                sampling_config = SamplingConfig(**{config.track: track_sample_config})  # type: ignore
+
+                # Sampling has to be done per-prompt, since sampling configs
+                # are likely be different for different prompts.
+                per_prompt_forward_and_sample_output = _sample_per_prompt(
+                    per_prompt_cur_sampled,
+                    per_prompt_forward_out,
+                    sampling_config,
+                    tokenizers,
+                    decode_sasa_tokens=False,
+                    sample_argmax=sample_argmax
+                )
+
+                # All positions sampled after _sample_per_prompt() above.
+                # (B, L) & (B, L, D)
+                per_prompt_new_sampled = per_prompt_forward_and_sample_output.protein_tensor
+
+                # Find the positions we should sample this round.
+                assert per_prompt_forward_and_sample_output.entropy is not None
+                assert per_prompt_forward_and_sample_output.all_logprob is not None 
+                try:
+                    where_to_sample = _get_iterative_sampling_mask_for_prompt_and_step(
+                        per_prompt_cur_sampled,
+                        torch.tensor(sequence_lengths[i]),
+                        torch.tensor(total_to_sample[i]),
+                        t,
+                        per_prompt_forward_and_sample_output.entropy,
+                        config,
+                        tokenizers,
+                        per_prompt_forward_and_sample_output.all_logprob
+                    )
+                except ValueError as e:
+                    errors[i] = ESMProteinError(error_code=500, error_msg=str(e))
+                    continue
+
+                where_to_sample.to(input_tokens[0].device)
+
+                old_track_samples = getattr(per_prompt_cur_sampled, config.track)
+                new_track_samples = getattr(per_prompt_new_sampled, config.track)
+                #if config.track == "structure":
+                #    score = get_lookahead_ptm(per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                #            i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
+                #            input_tokens, batched_tokens, client)
+                    #print(f"Timestep {t}: score {score}")
+
+                # Iterative sampling by picking the tokens sampled this round
+                # from new_track_samples to old_track_samples.
+                new_track_samples = torch.where(
+                    where_to_sample, new_track_samples, old_track_samples
+                )
+                
+                # Update the corresponding row with new data.
+                getattr(batched_tokens, config.track)[i, ...] = new_track_samples[0]
 
 def iterative_sampling_tokens(
     client: ESM3InferenceClient,
