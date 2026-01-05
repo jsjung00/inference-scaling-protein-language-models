@@ -115,7 +115,9 @@ def iterative_sampling_raw(
     input_tokens = [client.encode(protein) for protein in proteins]
   
     if search_type is not None:
-        output_tokens_list = client.search_batch_generate(input_tokens, configs, search_type, sample_argmax=sample_argmax) 
+        # TODO: assumes that we only do generation for sequence, which returns a folded protein
+        folded_protein = client.search_batch_generate(input_tokens, configs, search_type, sample_argmax=sample_argmax)
+        return folded_protein  
     else:
         output_tokens_list = client.batch_generate(input_tokens, configs, sample_argmax=sample_argmax)
 
@@ -517,11 +519,14 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
             old_track_samples = getattr(per_prompt_cur_sampled, config.track)
             new_track_samples = getattr(per_prompt_new_sampled, config.track)
             if config.run_intermediate_correlation:
-                score = get_lookahead_ptm(config.track == 'sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                ptmscore, gen_structure = get_lookahead_ptm(config.track == 'sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
                         i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
                         input_tokens, batched_tokens, client, structure_best_of_n=16)
+                
+                rMSDScore = get_rmsd_score(gen_structure, config.eval_chain, config.mobile_inds, config.target_inds)
+
                 logger = logging.getLogger("correlation")
-                logger.info(f"Timestep {t}: score {score}")
+                logger.info(f"Timestep {t}: ptmScore {ptmscore} | rmsdScore {rMSDScore}")
 
             new_track_samples = torch.where(
                 where_to_sample, new_track_samples, old_track_samples
@@ -619,12 +624,13 @@ def run_n_steps(max_num_steps, disable_tqdm, client, batched_tokens, configs, er
                 old_track_samples = getattr(per_prompt_cur_sampled, config.track)
                 new_track_samples = getattr(per_prompt_new_sampled, config.track)
                 if config.run_intermediate_correlation:
-                    score = get_lookahead_ptm(config.track == 'sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                    ptmscore, gen_structure = get_lookahead_ptm(config.track == 'sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
                             i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
                             input_tokens, batched_tokens, client, structure_best_of_n=16)
                     logger = logging.getLogger("correlation")
-                    logger.info(f"Timestep {t}: score {score}")
-
+                    rMSDScore = get_rmsd_score(gen_structure, config.eval_chain, config.mobile_inds, config.target_inds)
+                    logger.info(f"Timestep {t}: ptmScore {ptmscore} | rmsdScore {rMSDScore}")
+                    
                 # Iterative sampling by picking the tokens sampled this round
                 # from new_track_samples to old_track_samples.
                 new_track_samples = torch.where(
@@ -723,13 +729,22 @@ class BeamChild:
     batched_tokens: ESMProteinTensor
     forward_out: torch.Tensor 
     t: int 
-    score: Optional[float]
+    pTMScore: Optional[float]
+    rMSDScore: Optional[float]
+    folded_structure: Optional[Any]
+
+def get_rmsd_score(gen_structure, eval_chain, mobile_inds, target_inds):
+    structure_prediction_chain = gen_structure.to_protein_chain()
+    structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+    return structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
 
 def get_lookahead_ptm(from_sequence, per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
                        i, t, per_prompt_forward_and_sample_output, config, tokenizers,\
                        input_tokens, batched_tokens, client, structure_best_of_n):
     '''
     from_sequence: (bool) Input is sequence, so we generate a fold from the denoised sequence. Else assume that input is a structure, so we get pTM from the structure
+    
+    Returns tuple of score, Optional[fold structure]
     '''
     try:
         all_where_to_sample = _get_all_denoise_sampling_mask(
@@ -763,13 +778,17 @@ def get_lookahead_ptm(from_sequence, per_prompt_cur_sampled, old_track_samples, 
         best_of_n_structure = generate_structure(lookahead_protein, client, best_of_n=structure_best_of_n, batched_generate=False) 
         if best_of_n_structure.ptm:
             score = best_of_n_structure.ptm.item()
-            return score 
-        return None 
+            return score, best_of_n_structure 
+        return None, None  
     else:
         if lookahead_protein.ptm:
             score = lookahead_protein.ptm.item()  
-            return score 
-        return None 
+            return score, None  
+        return None, None  
+
+def get_protein_score(pTM, RMSD):
+    # Large is better. 
+    return -1 * (np.exp(-5 * (pTM - 0.8)) + np.exp(0.5 * (RMSD - 2.0)))
 
 def search_iterative_sampling_tokens(
     client: ESM3InferenceClient,
@@ -781,7 +800,7 @@ def search_iterative_sampling_tokens(
 ) -> Sequence[ESMProteinTensor | ESMProteinError]:
     '''
     Like iterative sampling tokens but implements tree search for generation.
-    Assume batch size is 1. 
+    Assume batch size is 1. (TODO: add batched sampling) 
 
     Params:
         search_type: (str) "beam" or "mcts"
@@ -792,13 +811,12 @@ def search_iterative_sampling_tokens(
     
     sampled_tokens = [attr.evolve(tokens) for tokens in input_tokens]
 
-    assert len(configs) == 1
+    assert len(configs) == 1, "TODO: add batched sampling. Currently b=1"
     # Clear structure tokens if user would like to condition only on coordinates.
     for tokens, config in zip(sampled_tokens, configs):
         if config.condition_on_coordinates_only and tokens.coordinates is not None:
             tokens.structure = None
     
-
     # Total sequence lengths.
     sequence_lengths = [len(tokens) for tokens in sampled_tokens]
     # Figure out the number of tokens to be sampled for each prompt.
@@ -857,11 +875,6 @@ def search_iterative_sampling_tokens(
                     error_msg=f"Iterative sampling {config.track} is not supported.",
                 )
                 continue
-
-            if t >= config.num_steps:
-                # Done sampling for this row. Shouldn't ever execute because we stop before. 
-                child = BeamChild(child_batched_tokens, forward_out, t, score)
-                return child 
 
             per_prompt_cur_sampled = _BatchedESMProteinTensor.from_protein_tensor(
                 batched_tokens.slice(i)
@@ -932,14 +945,15 @@ def search_iterative_sampling_tokens(
 
             where_to_sample.to(input_tokens[0].device)
 
-        
             # Iterative sampling by picking the tokens sampled this round
             # from new_track_samples to old_track_samples.
             old_track_samples = getattr(per_prompt_cur_sampled, config.track)
-            score = get_lookahead_ptm(config.track=='sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
-                    i, t, per_prompt_forward_and_sample_output, config, tokenizers, input_tokens, batched_tokens, client, structure_best_of_n=16)
-            print(f"Child score {score}")
-            if score is None:
+            ptmScore, gen_structure = get_lookahead_ptm(config.track=='sequence', per_prompt_cur_sampled, old_track_samples, new_track_samples, sequence_lengths, total_to_sample,\
+                    i, t, per_prompt_forward_and_sample_output, config, tokenizers, input_tokens, batched_tokens, client, structure_best_of_n=16) 
+            
+            rMSDScore = get_rmsd_score(gen_structure, config.eval_chain, config.mobile_inds, config.target_inds)
+            print(f"Child pTM score {ptmScore} and rMSD score {rMSDScore} and score {get_protein_score(ptmScore, rMSDScore)}")
+            if ptmScore is None or rMSDScore is None:
                 raise ValueError("Error ocurred, failed to get score") 
 
             new_track_samples = torch.where(
@@ -952,8 +966,7 @@ def search_iterative_sampling_tokens(
             # calculate a new forward_out based on our new batched tokens
             child_forward_out = _batch_forward(client, child_batched_tokens)
 
-
-            child = BeamChild(child_batched_tokens, child_forward_out, t+1, score)
+            child = BeamChild(child_batched_tokens, child_forward_out, t+1, ptmScore, rMSDScore, gen_structure)
             return child 
 
         raise ValueError("Failed to get a child")
@@ -967,7 +980,7 @@ def search_iterative_sampling_tokens(
         leaf_node_generated_structures = [] 
         forward_out = _batch_forward(client, batched_tokens)
         nfes += 1
-        parent_node = BeamChild(batched_tokens, forward_out, 0, None)
+        parent_node = BeamChild(batched_tokens, forward_out, 0, None, None, None)
         queue.append(parent_node)
         
         intermediate_values = defaultdict(list)
@@ -986,32 +999,28 @@ def search_iterative_sampling_tokens(
 
             # log all the intermediate values
             for child in beam_children:
-                intermediate_values[int(child.t)].append(child.score)
+                intermediate_values[int(child.t)].append(get_protein_score(child.pTMScore, child.rMSDScore))
             
-            top_k_children = sorted(beam_children, key=lambda x: x.score, reverse=True)[:beam_best_k]
+            top_k_children = sorted(beam_children, key=lambda x: get_protein_score(x.pTMScore, x.rMSDScore), reverse=True)[:beam_best_k]
             queue.extend(top_k_children)
         
-        batched_tokens = max(leaf_node_generated_structures, key=lambda x: x.score).batched_tokens
+        batched_tokens = max(leaf_node_generated_structures, key=lambda x: get_protein_score(x.pTMScore, x.rMSDScore)).batched_tokens
         print(f"Number of NFEs: {nfes}")
-        # UNCOMMENT to save for intermediate value analysis
-        #logger.info(json.dumps(intermediate_values))
 
     elif search_type == "beam":
-        beam_num_child = configs[0].beam_num_child
-        beam_best_k = configs[0].beam_best_k
-        beam_warmup_steps = configs[0].beam_warmup_steps
-        beam_explore_best_k = configs[0].beam_explore_best_k
+        beam_num_child = configs[0].beam_num_child #number of children to create for each parent
+        beam_best_k = configs[0].beam_best_k # number of children to continue as parents for next round
+        beam_warmup_steps = configs[0].beam_warmup_steps #number of timesteps to generate without branching 
+        beam_explore_best_k = configs[0].beam_explore_best_k #number of parents/childrens as seperate lines in warmup phase 
 
         nfes = 0 
         queue = deque()
         leaf_node_generated_structures = [] 
         forward_out = _batch_forward(client, batched_tokens)
         nfes += 1
-        parent_node = BeamChild(batched_tokens, forward_out, 0, None)
+        parent_node = BeamChild(batched_tokens, forward_out, 0, None, None, None)
         queue.append(parent_node)
-        
         intermediate_values = defaultdict(list)
-
 
         # warmup exploration phase
         if beam_warmup_steps > 0:
@@ -1024,7 +1033,7 @@ def search_iterative_sampling_tokens(
 
                 forward_out = _batch_forward(client, explore_batched_tokens)
                 nfes += 1
-                child_node = BeamChild(explore_batched_tokens, forward_out, beam_warmup_steps, None)
+                child_node = BeamChild(explore_batched_tokens, forward_out, beam_warmup_steps, None, None, None)
                 queue.append(child_node)
 
         while len(queue) > 0:
@@ -1045,14 +1054,17 @@ def search_iterative_sampling_tokens(
                     all_children.append(child)
           
             if len(all_children) > 0:
-                top_k_children = sorted(all_children, key=lambda x: x.score, reverse=True)[:beam_best_k]
+                top_k_children = sorted(all_children, key=lambda x: get_protein_score(x.pTMScore, x.rMSDScore), reverse=True)[:beam_best_k]
                 queue.extend(top_k_children)
 
-     
+        # return the bestofN folded structure corresponding to the best sequence if sequence generation
+        if configs[0].track == "sequence":
+            best_gen_structure = max(leaf_node_generated_structures, key=lambda x: get_protein_score(x.pTMScore, x.rMSDScore)).folded_structure
+            print(f"Number of NFEs: {nfes}") 
+            return best_gen_structure
 
-        batched_tokens = max(leaf_node_generated_structures, key=lambda x: x.score).batched_tokens
-        print(f"Number of NFEs: {nfes}")
-        pass 
+        batched_tokens = max(leaf_node_generated_structures, key=lambda x: get_protein_score(x.pTMScore, x.rMSDScore)).batched_tokens
+        print(f"Number of NFEs: {nfes}") 
             
     elif search_type == "mcts":
         raise NotImplementedError("Finish MCTS") 
@@ -1191,7 +1203,6 @@ def generate_structure(sequence_obj, model, best_of_n=1, sample_argmax=False, ba
     '''
     Generate the best of n structure from the generated sequence object (only using the sequence information)
     '''
-
     structure_generation_config = GenerationConfig(track="structure", num_steps=32, strategy='random')
     structure_prediction_prompt = ESMProtein(sequence=sequence_obj.sequence)
     

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC
 from copy import deepcopy
-from typing import Sequence
+from typing import Sequence, Optional, Any
 
 import attr
 import torch
@@ -315,6 +315,11 @@ class GenerationConfig:
     beam_best_k: int = 1 
     beam_explore_best_k: int = 1
     beam_warmup_steps: int = 0 
+
+    # for search scoring 
+    eval_chain: Optional[Any] = None 
+    mobile_inds: Optional[Any] = None 
+    target_inds: Optional[Any] = None 
 
     # for the intemediate correlation experiment
     run_intermediate_correlation: bool = False 

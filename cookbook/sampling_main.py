@@ -4,7 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from esm.models.esm3 import ESM3
 from esm.sdk.api import ESM3InferenceClient, ESMProtein, GenerationConfig
 from esm.utils.structure.protein_chain import ProteinChain
-from esm.utils.generation import generate_structure
+from esm.utils.generation import generate_structure, get_rmsd_score
 import numpy as np 
 import scipy
 import math  
@@ -230,32 +230,25 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
     Params:
         eval_residue: (str) Space separated amino acid sequence contianing coordinating residues 
     '''
-    #protein_prompt, target_inds, mobile_inds, eval_chain = easier_ligand_prompt(pdb_id, given_fraction=given_fraction)
     protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt(pdb_id, coor_residues, place_orig_order=True)
   
-    seq_generation_config = GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type)
-  
     if search_type is not None and search_type in ['mcts', 'beam', 'tree']:
-        # TODO: FIX 
-        raise ValueError("Search should be on sequence!!")
-        # only use search for structure generation for now  
-        sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=sample_argmax) 
-        structure_generation_config = GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type,\
-                                        beam_num_child=beam_num_child,\
-                                            beam_best_k=beam_best_k,beam_explore_best_k=beam_explore_best_k, beam_warmup_steps=beam_warmup_steps)
-        seq_only_structure_protein_prompt = ESMProtein(sequence=sequence_generation.sequence)
-        structure_prediction = model.search_batch_generate([sequence_generation], [structure_generation_config],
-                                                 sample_argmax=sample_argmax, search_type=search_type)[0] 
+        # currently only do search over sequences
+        seq_generation_config = GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type,\
+                                                 beam_num_child=beam_num_child, beam_best_k=beam_best_k, beam_explore_best_k=beam_explore_best_k,\
+                                                    beam_warmup_steps=beam_warmup_steps, eval_chain=eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
+        structure_prediction = model.search_batch_generate([protein_prompt], [seq_generation_config], sample_argmax=sample_argmax, search_type=search_type) 
+        #structure_prediction = generate_structure(sequence_generation, model, best_of_n=128, batched_generate=False) 
+        #structure_prediction = model.search_batch_generate([sequence_generation], [structure_generation_config],
+        #                                         sample_argmax=sample_argmax, search_type=search_type)[0] 
     elif search_type is None:
+        seq_generation_config = GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type)
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=sample_argmax)
         structure_prediction = generate_structure(sequence_generation, model, best_of_n=16, batched_generate=False) 
     else:
         raise ValueError("Search strategy value either None or mcts, beam, tree")
     gen_ptm = float(structure_prediction.ptm)
-    structure_prediction_chain = structure_prediction.to_protein_chain()
-    structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
-    crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
-
+    crmsd = get_rmsd_score(structure_prediction, eval_chain, mobile_inds, target_inds)
     return gen_ptm, crmsd
 
 
@@ -507,8 +500,9 @@ def run_intermediate_sequence_correlation(model, pdb_id='8GXP', coor_residues='W
 
     for _ in range(total_samples):
         protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt(pdb_id, coor_residues, place_orig_order=True)
-        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random', run_intermediate_correlation=True,\
-                                                 correlation_data_file_path=save_file_path)
+        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random',\
+                                                 run_intermediate_correlation=True, eval_chain=eval_chain, mobile_inds=mobile_inds,\
+                                                    target_inds=target_inds, correlation_data_file_path=save_file_path)
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
      
      
@@ -527,11 +521,12 @@ if __name__ == "__main__":
         rmsds_percentiles = np.percentile(rmsds, [1,10,50])
         logging.info(f"First 5 Ligand, 128 generations each. Beam_k={beam_best_k} Num_child={beam_num_child}: success={success_rate} ptm_50/90/99={ptms_percentiles} rmsds_1/10/50={rmsds_percentiles}")
     '''
-    run_intermediate_sequence_correlation(model)
+    #run_intermediate_sequence_correlation(model, total_samples=157, correlation_file_name='full_correlation.txt')
     #get_tertiary_coordination(2, 4096, model, sampling_type='random', num_steps=8,\
     #                          search_type=None)
+    get_tertiary_coordination(1, 128, model, sampling_type='random', num_steps=8, search_type='beam', beam_num_child=4,\
+                                beam_best_k=2, beam_warmup_steps=4, beam_explore_best_k=8)
     
-    breakpoint()
     
     protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt('8GXP', 'W317 C320 A321 H323 V376 F377 L396 I400 H479 Y502', place_orig_order=True)
     seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
