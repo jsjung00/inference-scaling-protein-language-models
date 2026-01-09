@@ -5,7 +5,7 @@ TLDR; We investigate test time inference scaling of protein language models unde
 *Beam Search vs Best-of-N tertiary coordination scaffold design success rate, where a success is defined by a pTM > 0.8 and rMSD < 2.0. Beam search success rate calculated using 60 generated samples.*
 
 # Getting started
-To get started you may run 'pip install -e .' See the pyproject.toml for dependencies. 
+To get started you may run `pip install -e .` See the pyproject.toml for dependencies. 
 This code is run using python 3.12.12. 
 
 # Running experiments
@@ -14,22 +14,22 @@ To reproduce the best-of-n inference scaling plot results in Figure 1, please ru
 
 #### Tertiary Coodination Protein Scaffold Design 
 To generate an unbiased estimate for the tertiary coordination scaffold generation success rate, please run in `python cookbook/sampling_main.py`
-'''
+```
 model = ESM3.from_pretrained("esm3-open").to("cuda")
-get_tertiary_coordination(1, 3500, model, sampling_type='random', num_steps=8, search_type=None):
-'''
+get_tertiary_coordination(1, 3500, model, sampling_type=`random`, num_steps=8, search_type=None):
+```
 
 To calculate the success rates of the beam search strategy as in Figure 4, please run 
-'run_tertiary_compute_scaling_experiment()' in `python cookbook/sampling_main.py`
+`run_tertiary_compute_scaling_experiment()` in `python cookbook/sampling_main.py`
 
 We note that due to the beam search algorithm implementation, the NFEs printed in console is an upperbound of the actual NFEs used for the search strategy. 
 
 #### Intermediate lookahead value correlation
 To reproduce the intermediate denoised lookahead sequences value correlation as in Figure 3, please run in `python cookbook/sampling_main.py`
-'''
+```
 model = ESM3.from_pretrained("esm3-open").to("cuda")
 run_intermediate_sequence_correlation(model, total_samples=156)
-''' 
+``` 
 
 
 
