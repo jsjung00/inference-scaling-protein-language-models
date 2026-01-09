@@ -238,9 +238,6 @@ def run_tertiary_coordination(pdb_id, coor_residues, model, sampling_type, num_s
                                                  beam_num_child=beam_num_child, beam_best_k=beam_best_k, beam_explore_best_k=beam_explore_best_k,\
                                                     beam_warmup_steps=beam_warmup_steps, eval_chain=eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
         structure_prediction = model.search_batch_generate([protein_prompt], [seq_generation_config], sample_argmax=sample_argmax, search_type=search_type) 
-        #structure_prediction = generate_structure(sequence_generation, model, best_of_n=128, batched_generate=False) 
-        #structure_prediction = model.search_batch_generate([sequence_generation], [structure_generation_config],
-        #                                         sample_argmax=sample_argmax, search_type=search_type)[0] 
     elif search_type is None:
         seq_generation_config = GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type)
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=sample_argmax)
@@ -279,17 +276,17 @@ def get_tertiary_coordination(first_k_ligand, num_gen_per_ligand, model, samplin
                             beam_num_child=beam_num_child, beam_best_k=beam_best_k, beam_explore_best_k=beam_explore_best_k, 
                             beam_warmup_steps=beam_warmup_steps, sample_argmax=sample_argmax)
             print(f"Ligand {pdb_id} PTM {pTM} rMSD {rMSD}")
-            success += int(pTM > 0.8 and rMSD < 1.5)
+            success += int(pTM > 0.8 and rMSD < 2.0)
             print(f"Ligand {pdb_id} success rate so far {success} / {i+1}")
             ligand_generation_stats[pdb_id].append((pTM, rMSD))
 
-    # calculate the total success rate where succeed if pTM > 0.8 and rMSD < 1.5 
+    # calculate the total success rate where succeed if pTM > 0.8 and rMSD < 2.0
     total_samples, total_success = 0, 0
     ptms, rmsds = [], [] 
     best_ptm, best_rmsd = 0, 1e10
     for ligand,results in ligand_generation_stats.items():
         total_samples += len(results)
-        success_samples = list(filter(lambda x: (x[0] > 0.8) and (x[1] < 1.5), results))
+        success_samples = list(filter(lambda x: (x[0] > 0.8) and (x[1] < 2.0), results))
         total_success += len(success_samples)
         for x in results:
             best_ptm = max(best_ptm, x[0])
@@ -318,7 +315,7 @@ def get_confidence_interval(values):
 class Experiment:
     def __init__(self, exp_type, search_type=None, strategy='top_margin', baseline_strategies=['entropy', 'random'],\
                     num_samples=128, experiment_log_dir="./logs", beam_num_child=1, beam_best_k=1):
-        self.exp_type = exp_type # ['uncond_ptm', 'tertiary_coordination'] #TODO: add diversity?
+        self.exp_type = exp_type # ['uncond_ptm'] 
         self.model = ESM3.from_pretrained("esm3-open").to("cuda")
         self.num_samples = num_samples
         self.experiment_log_dir = experiment_log_dir
@@ -332,10 +329,8 @@ class Experiment:
     def run_experiment(self, seq_len, num_steps, best_of_n):
         if self.exp_type == 'uncond_ptm':
             return self.uncond_ptm(seq_len, num_steps, best_of_n)
-        elif self.exp_type == "tertiary_coordination":
-            pass 
         else:
-            raise ValueError(f"Currently only support exp type ['uncond_ptm', 'tertiary_coordination']")
+            raise ValueError(f"Currently only support exp type ['uncond_ptm']")
 
     def sweep(self, list_num_steps, list_seq_lens, list_nfes):
         now = datetime.now()
@@ -377,10 +372,6 @@ class Experiment:
             results[f"{baseline_strategy}_CI"] = get_confidence_interval(baseline_strategy_ptm_scores)
         return results 
     
-    def tertiary_coordination(self, seq_len, num_steps):
-        results = {} 
-
-        pass 
 
 def get_fold_std(sequence_obj, model, best_of_n=[8,32,128], num_samples=128, sample_argmax=False):
     '''
@@ -405,6 +396,9 @@ def get_fold_std(sequence_obj, model, best_of_n=[8,32,128], num_samples=128, sam
 
 ### misc experiment drivers ###
 def run_fold_std_experiment(pdb_id='7map'):
+    '''
+    Calculate the protein folding standard deviation for a fixed generated sequence under different folding best-of-n
+    '''
     protein_prompt, target_inds, mobile_inds, eval_chain = medium_ligand_prompt(pdb_id, given_fraction=0.25)
     seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
     sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
@@ -412,9 +406,12 @@ def run_fold_std_experiment(pdb_id='7map'):
     print(best_of_n_score_std)
     print(best_of_n_score_mean)
 
-def run_best_of_n_experiment(model, total_samples=1000, batched_generate=True):
+def run_best_of_n_experiment(model, total_samples=1000, batched_generate=False):
     '''
-    Pass 
+    Additional experiment of evaluating scaffold design the prompt is partial continguous blocks from the coordinating ligand residues
+        and get success rate over total_samples. 
+        Allows for batched structure prediction. (NOTE: Need to ensure that batched performance is identical. From preliminary experiments,
+        batched struture generation is slightly worse, but within CI) 
     '''
     success = 0 
     ptms, rmsds = [], [] 
@@ -463,24 +460,7 @@ def run_given_fraction_sweep(model, given_fractions=[0.05, 0.1, 0.25], total_sam
 
         print(f"Given fraction={given_fraction} has success rate {success} / {total_samples}")
     return success_rate_per_fraction
-
-def run_orig_order_tertiary_experiment(model):
-    success = 0 
-    total_samples=10000
-    for _ in range(total_samples):
-        protein_prompt, target_inds, mobile_inds, eval_chain = medium_ligand_prompt('7map',given_fraction=0.25)
-        seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
-        sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
-        structure_prediction = generate_structure(sequence_generation, model, best_of_n=8)
-        
-        gen_ptm = float(structure_prediction.ptm)
-        structure_prediction_chain = structure_prediction.to_protein_chain()
-        structure_prediction_chain.align(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
-        crmsd = structure_prediction_chain.rmsd(eval_chain, mobile_inds=mobile_inds, target_inds=target_inds)
-        print(f"PTM {gen_ptm} and RMSD {crmsd}")
-        success += int(gen_ptm > 0.8 and crmsd <1.5)
-    print(f"Success rate {success}/{total_samples}")
-    pass 
+    
 
 def run_intermediate_sequence_correlation(model, pdb_id='8GXP', coor_residues='W317 C320 A321 H323 V376 F377 L396 I400 H479 Y502',
                                            total_samples=1000, correlation_file_name='correlation.txt'):
@@ -504,8 +484,29 @@ def run_intermediate_sequence_correlation(model, pdb_id='8GXP', coor_residues='W
                                                  run_intermediate_correlation=True, eval_chain=eval_chain, mobile_inds=mobile_inds,\
                                                     target_inds=target_inds, correlation_data_file_path=save_file_path)
         sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
+
+def unconditional_generation_experiment():
+    '''
+    Runs unconditional Best-of-N scaling as we varyy the NFEs
+
+    Saves in logs/ folder
+    '''
+    exp = Experiment('uncond_ptm', search_type=None, strategy='random', num_samples=128, baseline_strategies=[])
+    num_steps = [8,16]
+    seq_lens = [128, 256, 512]
+    nfes = [8, 16, 64, 128, 512, 1024, 2048] 
+    exp.sweep(num_steps, seq_lens, nfes)
+    return 
      
-     
+    
+def run_tertiary_compute_scaling_experiment(model, search_type='beam'):
+    beam_num_child_best_k = [(4,1), (4,2), (4,4), (4,8)]
+    for (num_child, best_k) in beam_num_child_best_k:
+        success_rate, _, _ = get_tertiary_coordination(1, 60, model, 'random', 8, search_type,\
+                               beam_num_child=num_child, beam_best_k=best_k,beam_warmup_steps=4, beam_explore_best_k=num_child*best_k, sample_argmax=False) 
+
+        print(f"Beam num child{num_child} and beam best k {best_k}: success rate = {success_rate} for 60 generations")
+    return 
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -514,63 +515,9 @@ if __name__ == "__main__":
         format="%(message)s"
     )
     model = ESM3.from_pretrained("esm3-open").to("cuda")
-    '''
-    for (beam_best_k, beam_num_child) in [(4, 8), (6, 12), (10, 32), (12, 48), (16, 64), (20, 100)]:
-        success_rate, ptms, rmsds = get_tertiary_coordination(2, 128, model, sampling_type='random', num_steps=8, beam_best_k=beam_best_k, beam_num_child=beam_num_child, search_type='beam')
-        ptms_percentiles = np.percentile(ptms, [50,90,99])
-        rmsds_percentiles = np.percentile(rmsds, [1,10,50])
-        logging.info(f"First 5 Ligand, 128 generations each. Beam_k={beam_best_k} Num_child={beam_num_child}: success={success_rate} ptm_50/90/99={ptms_percentiles} rmsds_1/10/50={rmsds_percentiles}")
-    '''
-    #run_intermediate_sequence_correlation(model, total_samples=157, correlation_file_name='full_correlation.txt')
-    #get_tertiary_coordination(2, 4096, model, sampling_type='random', num_steps=8,\
+    #run_intermediate_sequence_correlation(model, total_samples=156, correlation_file_name='full_correlation.txt')
+    #get_tertiary_coordination(1, 4096, model, sampling_type='random', num_steps=8,\
     #                          search_type=None)
-    get_tertiary_coordination(1, 128, model, sampling_type='random', num_steps=8, search_type='beam', beam_num_child=4,\
-                                beam_best_k=2, beam_warmup_steps=4, beam_explore_best_k=8)
+    run_tertiary_compute_scaling_experiment(model)
     
-    
-    protein_prompt, target_inds, mobile_inds, eval_chain = generate_ligand_prompt('8GXP', 'W317 C320 A321 H323 V376 F377 L396 I400 H479 Y502', place_orig_order=True)
-    seq_generation_config = GenerationConfig(track="sequence", num_steps=8, temperature=0.7, strategy='random')
-    sequence_generation = model.generate(protein_prompt, seq_generation_config, sample_argmax=False)
-    generate_structure(sequence_generation, model, best_of_n=16, sample_argmax=False)
-    
-    #run_given_fraction_sweep(model, given_fractions=[0.25], total_samples=128)
-    #
-
-    # next todo: figure out what is a fair n to have the maximum fold score be representative. Hoping 8 is fine
-    # then, run the best of N code below. you can refactor this pretty easily. you should also for loop over PDB ids.  
-
-    '''
-    for (beam_best_k, beam_num_child, beam_explore_best_k) in [(32, 1, 32)]:
-        max_ptm,min_rmsd, ptms, rmsds = 0,1e10, [], []
-        for i in range(1000000):
-            ptm, rmsd = run_tertiary_coordination('7map', 'D25 G27 A28 D29 D30 G48 G49 V50', model, sampling_type='random',\
-                                    num_steps=64, search_type=None, sample_argmax=False, beam_num_child=beam_num_child,\
-                                    beam_best_k=beam_best_k,beam_explore_best_k=beam_explore_best_k,\
-                                    beam_warmup_steps=7, given_fraction=0.5)
-            #structure = uncond_seq_struct_gen(model, 269, sampling_type='random', num_steps=8, search_type=None, sample_argmax=False,\
-        #                   beam_num_child=1, beam_best_k=1)
-            
-            max_ptm = max(max_ptm, ptm)
-            min_rmsd = min(min_rmsd, rmsd)
-            print(f"generation{i} Max PTM {max_ptm} and min RMSD {min_rmsd}")
-            ptms.append(ptm)
-            rmsds.append(rmsd)
-    
-        both_ptm_rmsd = sorted(list(zip(ptms, rmsds)), key=lambda x: x[0], reverse=True)
-
-        ptms_percentiles = np.percentile(ptms, [50,90,99])
-        rmsds_percentiles = np.percentile(rmsds, [1,10,50])
-        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. MaxPTM: {max_ptm}")
-        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. Ptm50/90/99: {ptms_percentiles}")
-        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. RMSD1/10/50: {rmsds_percentiles}")
-        logging.info(f"7map, 1mil generations 64 step. Beam_k={beam_best_k} Num_child={beam_num_child}. Top10ptms: {both_ptm_rmsd[:10]}") 
-    '''
-
-    #exp = Experiment('uncond_ptm', search_type="beam", strategy='random', num_samples=128, baseline_strategies=[], beam_best_k=8, beam_num_child=8)
-    #exp.sweep([8], [256], [8])
-    
-    #result = exp.uncond_ptm(256, 64)
-    #print(result)
-    #uncond_generation_experiment() 
-    #
-    #uncond_seq_struct_gen(model, 256, "random", 128)
+   
