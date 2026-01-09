@@ -17,24 +17,18 @@ import random
 import torch 
 from pathlib import Path 
 
-def uncond_seq_struct_gen(model, seq_len, sampling_type, num_steps, search_type, sample_argmax=False,\
-                          beam_num_child=1, beam_best_k=1, beam_warmup_steps=0):
-    prompt = "_" * seq_len
-    protein = ESMProtein(sequence=prompt)
-  
-    if search_type is not None and search_type in ['mcts', 'beam', 'tree']:
-        # only use search for structure generation for now  
-        sequence = model.generate(protein, GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type), sample_argmax=sample_argmax)
-        structure = model.search_batch_generate([sequence], [GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type,\
-                                                                beam_num_child=beam_num_child,beam_best_k=beam_best_k, beam_warmup_steps=beam_warmup_steps)],
-                                                 sample_argmax=sample_argmax, search_type=search_type)[0] 
-    elif search_type is None:
-        sequence = model.generate(protein, GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type), sample_argmax=sample_argmax)
-        structure = model.generate(sequence, GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type), sample_argmax=sample_argmax) 
-    else:
-        raise ValueError("Search strategy value either None or mcts, beam, tree")
+SCAFFOLD_SEQ_LENGTHS = [150,250,350]
 
-    return structure 
+### Misc utilities ###
+def get_confidence_interval(values):
+    '''
+    Return 0.95 low and upper CI 
+    '''
+    mean_value = np.mean(values)
+    std = np.std(values, ddof=1)
+
+    correction = 1.96*std / math.sqrt(len(values))
+    return mean_value - correction, mean_value + correction
 
 def get_ptm_scores(num_samples, model, seq_len, sampling_type, num_steps, search_type, best_of_n=1, beam_num_child=1, beam_best_k=1):
     ptm_scores = [] 
@@ -83,6 +77,48 @@ def place_spans(span_lengths, total_length):
     
     return positions
 
+def uncond_seq_struct_gen(model, seq_len, sampling_type, num_steps, search_type, sample_argmax=False,\
+                          beam_num_child=1, beam_best_k=1, beam_warmup_steps=0):
+    prompt = "_" * seq_len
+    protein = ESMProtein(sequence=prompt)
+  
+    if search_type is not None and search_type in ['mcts', 'beam', 'tree']:
+        # only use search for structure generation for now  
+        sequence = model.generate(protein, GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type), sample_argmax=sample_argmax)
+        structure = model.search_batch_generate([sequence], [GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type,\
+                                                                beam_num_child=beam_num_child,beam_best_k=beam_best_k, beam_warmup_steps=beam_warmup_steps)],
+                                                 sample_argmax=sample_argmax, search_type=search_type)[0] 
+    elif search_type is None:
+        sequence = model.generate(protein, GenerationConfig(track="sequence", num_steps=num_steps, temperature=0.7, strategy=sampling_type), sample_argmax=sample_argmax)
+        structure = model.generate(sequence, GenerationConfig(track="structure", num_steps=num_steps, strategy=sampling_type), sample_argmax=sample_argmax) 
+    else:
+        raise ValueError("Search strategy value either None or mcts, beam, tree")
+
+    return structure 
+
+def get_fold_std(sequence_obj, model, best_of_n=[8,32,128], num_samples=128, sample_argmax=False):
+    '''
+    Get the std and mean of best-of-n generated fold score 
+    '''
+    best_of_n_score_std = {k: None for k in best_of_n} #key: n in best-of-n, value: variance of best-of-n score
+    best_of_n_score_mean = {k: None for k in best_of_n}
+    for n in best_of_n:
+        best_fold_scores = []
+        for _ in range(num_samples):
+            best_structure = generate_structure(sequence_obj, model, best_of_n=n, sample_argmax=sample_argmax)
+            best_of_n_ptm = float(best_structure.ptm)
+            best_fold_scores.append(best_of_n_ptm)
+        best_fold_scores = np.array(best_fold_scores)
+        mean, std = np.mean(best_fold_scores), np.std(best_fold_scores)
+        best_of_n_score_mean[n] = mean 
+        best_of_n_score_std[n] = std 
+        print(f"BestofN={n} Mean: {mean}, Std: {std}")
+    
+    return best_of_n_score_std, best_of_n_score_mean
+
+
+
+### Scaffold prompt generation and tertiary coordination ###
 def generate_ligand_prompt(pdb_id, coor_residues, chain_id='A', place_orig_order=False):
     '''
     Generates a ligand prompt as in the challenging tertiary coordination task in the ESM3 paper 
@@ -98,13 +134,14 @@ def generate_ligand_prompt(pdb_id, coor_residues, chain_id='A', place_orig_order
         use_orig_len: (bool) If true set scaffold sequence length to original chain length
         shuffle_spans: (bool) If true shuffle the span insertion location as in the original task 
     '''
+    SPAN_CONTINUITY_THRESHOLD = 5 
     eval_chain = ProteinChain.from_rcsb(pdb_id, chain_id) # data currently only single chain    
 
     # first uniformly define length
     if place_orig_order:
         seq_len = len(eval_chain)
     else:
-        seq_len = random.choice([150,250,350])
+        seq_len = random.choice(SCAFFOLD_SEQ_LENGTHS)
 
     seq_prompt_list = list('_' * seq_len)
     structure_prompt = torch.full((seq_len, 37, 3), np.nan).float()
@@ -134,7 +171,7 @@ def generate_ligand_prompt(pdb_id, coor_residues, chain_id='A', place_orig_order
         letter, position = residues_formatted[i]
         prev_letter, prev_position = residues_formatted[i-1]
 
-        if (position - prev_position) <= 5: 
+        if (position - prev_position) <= SPAN_CONTINUITY_THRESHOLD: 
             current_span.append((letter, position))
         else:
             residue_spans.append(current_span)
@@ -198,7 +235,7 @@ def medium_ligand_prompt(pdb_id, chain_id='A', motif_inds=None, given_fraction=0
         Define the prompt sequence to be either length 150, 250, or 350
     """
     eval_chain = ProteinChain.from_rcsb(pdb_id, chain_id) # data currently only single chain    
-    prompt_seq_len = random.choice([150,250,350])
+    prompt_seq_len = random.choice(SCAFFOLD_SEQ_LENGTHS)
     sequence_prompt = np.array(["_"] * prompt_seq_len)
     motif_seq_len = len(eval_chain) 
 
@@ -300,18 +337,7 @@ def get_tertiary_coordination(first_k_ligand, num_gen_per_ligand, model, samplin
 
     return success_rate, ptms, rmsds
 
-
-def get_confidence_interval(values):
-    '''
-    Return 0.95 low and upper CI 
-    '''
-    mean_value = np.mean(values)
-    std = np.std(values, ddof=1)
-
-    correction = 1.96*std / math.sqrt(len(values))
-    return mean_value - correction, mean_value + correction
-
-
+### Experiment drivers ###
 class Experiment:
     def __init__(self, exp_type, search_type=None, strategy='top_margin', baseline_strategies=['entropy', 'random'],\
                     num_samples=128, experiment_log_dir="./logs", beam_num_child=1, beam_best_k=1):
@@ -372,29 +398,7 @@ class Experiment:
             results[f"{baseline_strategy}_CI"] = get_confidence_interval(baseline_strategy_ptm_scores)
         return results 
     
-
-def get_fold_std(sequence_obj, model, best_of_n=[8,32,128], num_samples=128, sample_argmax=False):
-    '''
-    Get the std and mean of best-of-n generated fold score 
-    '''
-    best_of_n_score_std = {k: None for k in best_of_n} #key: n in best-of-n, value: variance of best-of-n score
-    best_of_n_score_mean = {k: None for k in best_of_n}
-    for n in best_of_n:
-        best_fold_scores = []
-        for _ in range(num_samples):
-            best_structure = generate_structure(sequence_obj, model, best_of_n=n, sample_argmax=sample_argmax)
-            best_of_n_ptm = float(best_structure.ptm)
-            best_fold_scores.append(best_of_n_ptm)
-        best_fold_scores = np.array(best_fold_scores)
-        mean, std = np.mean(best_fold_scores), np.std(best_fold_scores)
-        best_of_n_score_mean[n] = mean 
-        best_of_n_score_std[n] = std 
-        print(f"BestofN={n} Mean: {mean}, Std: {std}")
     
-    return best_of_n_score_std, best_of_n_score_mean
-
-
-### misc experiment drivers ###
 def run_fold_std_experiment(pdb_id='7map'):
     '''
     Calculate the protein folding standard deviation for a fixed generated sequence under different folding best-of-n

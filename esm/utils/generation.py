@@ -1030,7 +1030,9 @@ def search_iterative_sampling_tokens(
                 explore_batched_tokens = copy.deepcopy(batched_tokens)
                 run_n_steps(beam_warmup_steps, True, client, explore_batched_tokens, configs, errors,
                     tokenizers, sample_argmax,sequence_lengths,total_to_sample, input_tokens)
-
+                nfes += beam_warmup_steps
+                # NOTE: notation is bad. Keeping for reproducibility but we are doing one less beam search step.
+                # At warmup=7, we have zero beam num search step, since we determine the state via line below
                 forward_out = _batch_forward(client, explore_batched_tokens)
                 nfes += 1
                 child_node = BeamChild(explore_batched_tokens, forward_out, beam_warmup_steps, None, None, None)

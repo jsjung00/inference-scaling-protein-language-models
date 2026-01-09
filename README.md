@@ -1,8 +1,12 @@
 # Inference time scaling protein language models
+TLDR; We investigate test time inference scaling of protein language models under different generation search and sampling strategies. We benchmark on the ESM3 1.4B Open model and consider both unconditional structure generation quality (pTM) of various sequence lengths and challenging tertiary coordination protein scaffold design generation.
 
-TLDR; We investigate test time inference scaling of protein language models under different generation search and sampling strategies. We benchmark on the ESM3 Open model and consider both unconditional structure generation quality (pTM) of various sequence lengths and challenging tertiary coordination protein scaffold design generation.
+![Best-of-N scaling](./assets/scaling_beam_vs_bestofn_2.png)
+*Beam Search vs Best-of-N tertiary coordination scaffold design success rate, where a success is defined by a pTM > 0.8 and rMSD < 2.0. Beam search success rate calculated using 60 generated samples.*
 
-# TODO: add a plot of figure 4 scaling
+# Getting started
+To get started you may run 'pip install -e .' See the pyproject.toml for dependencies. 
+This code is run using python 3.12.12. 
 
 # Running experiments
 #### Best of N Inference Scaling
@@ -17,6 +21,8 @@ get_tertiary_coordination(1, 3500, model, sampling_type='random', num_steps=8, s
 
 To calculate the success rates of the beam search strategy as in Figure 4, please run 
 'run_tertiary_compute_scaling_experiment()' in `python cookbook/sampling_main.py`
+
+We note that due to the beam search algorithm implementation, the NFEs printed in console is an upperbound of the actual NFEs used for the search strategy. 
 
 #### Intermediate lookahead value correlation
 To reproduce the intermediate denoised lookahead sequences value correlation as in Figure 3, please run in `python cookbook/sampling_main.py`
