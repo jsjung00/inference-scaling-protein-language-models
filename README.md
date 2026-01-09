@@ -1,7 +1,7 @@
 # Inference time scaling protein language models
 TLDR; We investigate test time inference scaling of protein language models under different generation search and sampling strategies. We benchmark on the ESM3 1.4B Open model and consider both unconditional structure generation quality (pTM) of various sequence lengths and challenging tertiary coordination protein scaffold design generation.
 
-![Best-of-N scaling](./assets/scaling_beam_vs_bestofn_2.png)
+![Best-of-N scaling](./assets/scaling_comparison_2.png)
 *Beam Search vs Best-of-N tertiary coordination scaffold design success rate, where a success is defined by a pTM > 0.8 and rMSD < 2.0. Beam search success rate calculated using 60 generated samples.*
 
 # Getting started
